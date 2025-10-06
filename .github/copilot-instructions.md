@@ -1,0 +1,1 @@
+PELOTUDO NO GENERES MAS .MD mas alla del readme de como levantar el proyecto, si ves que hay mas q este, borralos (claramente el .github dejalo)
