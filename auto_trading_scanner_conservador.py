@@ -11,6 +11,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import requests
 from binance_futures_trader import BinanceFuturesTrader
+from trading_database import TradingDatabase
+from trading_dashboard import TradingDashboard, generate_quick_report
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -62,6 +64,9 @@ SL_ATR_BUFFER = 0.2
 TP_MULTS = [1.5, 2.5, 3.5]    # TPs más conservadores (más distantes)
 # ============================================
 
+# Inicializar base de datos
+db = TradingDatabase("trading_history.db")
+
 # Inicializar trader
 trader = None
 if AUTO_TRADE_ENABLED:
@@ -72,6 +77,35 @@ if AUTO_TRADE_ENABLED:
         print(f"❌ Error al inicializar trader: {e}")
         print("⚠️ El bot funcionará solo en modo alerta (sin trading)")
         AUTO_TRADE_ENABLED = False
+
+def generar_reportes_automaticos():
+    """Genera todos los reportes automáticamente después de cada escaneo"""
+    try:
+        print(f"\n{'='*60}")
+        print("📊 GENERANDO REPORTES AUTOMÁTICOS...")
+        print(f"{'='*60}")
+        
+        # Verificar si hay datos en la base de datos
+        stats = db.get_trade_stats()
+        
+        # 1. Reporte rápido en consola
+        print("\n📈 ESTADÍSTICAS RÁPIDAS:")
+        generate_quick_report("trading_history.db")
+        
+        # 2. Generar dashboard completo si hay trades cerrados
+        if stats['total_trades'] > 0:
+            print("\n📊 Generando gráficos completos...")
+            dashboard = TradingDashboard("trading_history.db")
+            dashboard.generate_full_report(output_dir="reports")
+            print("✅ Gráficos guardados en: reports/")
+        else:
+            print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
+            print("   Los gráficos se generarán cuando se cierren posiciones")
+        
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"⚠️ Error al generar reportes: {e}")
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -308,6 +342,60 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         
         if result:
             print(f"✅ Trade ejecutado: {symbol} {side}")
+            
+            # 📊 Registrar en la base de datos
+            try:
+                trade_id = db.add_trade(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=result['entry_price'],
+                    quantity=result['quantity'],
+                    leverage=result['leverage'],
+                    sl_price=result['sl_price'],
+                    tp_prices=result['tp_prices'],
+                    timeframe=timeframe,
+                    notes=f"Señal EMA Conservador - {timeframe}"
+                )
+                
+                # Registrar órdenes individuales
+                db.add_order(
+                    trade_id=trade_id,
+                    order_id=str(result['entry_order']['orderId']),
+                    order_type="ENTRY",
+                    side=result['entry_order']['side'],
+                    symbol=symbol,
+                    price=result['entry_price'],
+                    quantity=result['quantity'],
+                    status="FILLED"
+                )
+                
+                db.add_order(
+                    trade_id=trade_id,
+                    order_id=str(result['sl_order']['orderId']),
+                    order_type="STOP_LOSS",
+                    side=result['sl_order']['side'],
+                    symbol=symbol,
+                    price=result['sl_price'],
+                    quantity=result['quantity'],
+                    status="NEW"
+                )
+                
+                for i, tp_order in enumerate(result['tp_orders'], 1):
+                    db.add_order(
+                        trade_id=trade_id,
+                        order_id=str(tp_order['orderId']),
+                        order_type=f"TAKE_PROFIT_{i}",
+                        side=tp_order['side'],
+                        symbol=symbol,
+                        price=tp_order['stopPrice'],
+                        quantity=tp_order['origQty'],
+                        status="NEW"
+                    )
+                
+                print(f"📊 Trade registrado en DB: ID={trade_id}")
+            except Exception as e:
+                print(f"⚠️ Error al registrar en DB: {e}")
+            
             return True
         else:
             print(f"❌ No se pudo ejecutar el trade en {symbol}")
@@ -428,6 +516,9 @@ def scan_once():
     if AUTO_TRADE_ENABLED:
         print(f"🤖 Trades ejecutados: {trades_executed}")
     
+    # 📊 GENERAR REPORTES AUTOMÁTICAMENTE
+    generar_reportes_automaticos()
+    
     return signals_found, trades_executed
 
 def show_positions_summary():
@@ -474,6 +565,7 @@ def main():
     print("🛡️ Bot EMA Scanner CONSERVADOR + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
+    print(f"📊 Base de datos: trading_history.db")
     
     if AUTO_TRADE_ENABLED:
         print(f"🤖 TRADING AUTOMÁTICO ACTIVADO")

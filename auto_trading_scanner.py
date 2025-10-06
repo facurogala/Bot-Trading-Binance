@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
+from trading_dashboard import TradingDashboard, generate_quick_report
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -69,6 +70,35 @@ print("✅ Base de datos de trading inicializada")
 
 # Diccionario para rastrear trades abiertos
 open_trades_registry = {}  # {symbol: trade_id}
+
+def generar_reportes_automaticos():
+    """Genera todos los reportes automáticamente después de cada escaneo"""
+    try:
+        print(f"\n{'='*60}")
+        print("📊 GENERANDO REPORTES AUTOMÁTICOS...")
+        print(f"{'='*60}")
+        
+        # Verificar si hay datos en la base de datos
+        stats = db.get_trade_stats()
+        
+        # 1. Reporte rápido en consola
+        print("\n📈 ESTADÍSTICAS RÁPIDAS:")
+        generate_quick_report("trading_history.db")
+        
+        # 2. Generar dashboard completo si hay trades cerrados
+        if stats['total_trades'] > 0:
+            print("\n📊 Generando gráficos completos...")
+            dashboard = TradingDashboard("trading_history.db")
+            dashboard.generate_full_report(output_dir="reports")
+            print("✅ Gráficos guardados en: reports/")
+        else:
+            print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
+            print("   Los gráficos se generarán cuando se cierren posiciones")
+        
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"⚠️ Error al generar reportes: {e}")
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -361,6 +391,9 @@ def scan_once():
     if AUTO_TRADE_ENABLED:
         print(f"🤖 Trades ejecutados: {trades_executed}")
     
+    # 📊 GENERAR REPORTES AUTOMÁTICAMENTE
+    generar_reportes_automaticos()
+    
     return signals_found, trades_executed
 
 def check_closed_positions():
@@ -449,6 +482,8 @@ def main():
     print("🤖 Bot EMA Scanner + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
+    print(f"📊 Base de datos: trading_history.db")
+    print(f"📈 Reportes automáticos: Activados")
     
     if AUTO_TRADE_ENABLED:
         print(f"🤖 TRADING AUTOMÁTICO ACTIVADO")
