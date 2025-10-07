@@ -75,6 +75,14 @@ class TradingDatabase:
                 worst_trade REAL DEFAULT 0
             )
         ''')
+
+        # Tabla de sesiones por bot (para "arrancar desde cero")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_sessions (
+                bot TEXT PRIMARY KEY,
+                start_time TIMESTAMP NOT NULL
+            )
+        ''')
         
         conn.commit()
         # Migración: asegurar que la columna 'bot' exista si la tabla ya existía
@@ -244,8 +252,10 @@ class TradingDatabase:
         conn.close()
         return trades
     
-    def get_closed_trades(self, limit: Optional[int] = None, bot: Optional[str] = None) -> List[Dict]:
-        """Obtiene trades cerrados. Si 'bot' se indica, filtra por la columna 'bot' (fallback: notes LIKE)."""
+    def get_closed_trades(self, limit: Optional[int] = None, bot: Optional[str] = None, since: Optional[datetime] = None) -> List[Dict]:
+        """Obtiene trades cerrados. Si 'bot' se indica, filtra por la columna 'bot' (fallback: notes LIKE).
+        Si existe una sesión para ese bot o se pasa 'since', solo devuelve a partir de esa fecha.
+        """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -258,7 +268,17 @@ class TradingDatabase:
         if bot:
             # Intentar por columna 'bot'; si hay NULL/"", también considerar notes LIKE como respaldo
             query += " AND (bot = ? OR (bot IS NULL AND notes LIKE ?))"
-            params.extend([bot, f"%{bot}%"])
+            params.extend([bot, f"%{bot}%"]) 
+
+            # Aplicar sesión si no se pasó 'since'
+            if since is None:
+                start = self.get_bot_session_start(bot)
+                if start is not None:
+                    since = start
+
+        if since is not None:
+            query += " AND COALESCE(exit_time, entry_time) >= ?"
+            params.append(since)
         query += " ORDER BY exit_time DESC"
         
         if limit:
@@ -276,8 +296,10 @@ class TradingDatabase:
         conn.close()
         return trades
     
-    def get_trade_stats(self, bot: Optional[str] = None) -> Dict:
-        """Obtiene estadísticas generales de trading. Si 'bot' se indica, filtra por columna 'bot' (fallback: notes LIKE)."""
+    def get_trade_stats(self, bot: Optional[str] = None, since: Optional[datetime] = None) -> Dict:
+        """Obtiene estadísticas generales de trading. Si 'bot' se indica, filtra por columna 'bot' (fallback: notes LIKE).
+        Si existe una sesión para ese bot o se pasa 'since', solo cuenta trades desde esa fecha.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -286,6 +308,13 @@ class TradingDatabase:
         if bot:
             where += " AND (bot = ? OR (bot IS NULL AND notes LIKE ?))"
             params.extend([bot, f"%{bot}%"])
+            if since is None:
+                start = self.get_bot_session_start(bot)
+                if start is not None:
+                    since = start
+        if since is not None:
+            where += " AND COALESCE(exit_time, entry_time) >= ?"
+            params.append(since)
         
         # Total de trades
         cursor.execute(f"SELECT COUNT(*) FROM trades {where}", params)
@@ -467,6 +496,37 @@ class TradingDatabase:
         total_pnl = t[1] or 0.0
         rows.append({"bot": "TOTAL", "trades": total_trades, "total_pnl": total_pnl})
         return rows
+
+    # ===== Sesiones por bot =====
+    def start_bot_session(self, bot: str, start_time: Optional[datetime] = None) -> None:
+        """Inicia o reinicia la sesión (baseline) de un bot desde 'start_time' (o ahora)."""
+        if start_time is None:
+            start_time = datetime.now()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO bot_sessions (bot, start_time) VALUES (?, ?)",
+            (bot, start_time),
+        )
+        conn.commit()
+        conn.close()
+
+    def clear_bot_session(self, bot: str) -> None:
+        """Elimina la sesión (baseline) de un bot."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM bot_sessions WHERE bot = ?", (bot,))
+        conn.commit()
+        conn.close()
+
+    def get_bot_session_start(self, bot: str) -> Optional[str]:
+        """Obtiene el inicio de sesión de un bot o None si no existe."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT start_time FROM bot_sessions WHERE bot = ?", (bot,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
 
 
 # Función de prueba

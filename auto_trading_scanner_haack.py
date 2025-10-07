@@ -90,16 +90,16 @@ MIN_EMA_DISTANCE = 0.003      # 0.30%
 MIN_TREND_SLOPE = 0.0008      # pendiente relativa de EMA20 (en 10 velas)
 
 # Volumen
-MIN_VOLUME_RATIO = 1.10
+MIN_VOLUME_RATIO = 0.80
 
 # RSI
 RSI_LONG_MIN, RSI_LONG_MAX = 40, 70
 RSI_SHORT_MIN, RSI_SHORT_MAX = 30, 60
 
 # Stop/TP / Volatilidad
-MAX_SL_PERCENT = 0.035        # 3.5%
-MIN_ATR_PCT = 0.004           # 0.4%
-MAX_ATR_PCT = 0.030           # 3.0%
+MAX_SL_PERCENT = 0.080        # 3.5%
+MIN_ATR_PCT = 0.0015           # 0.4%
+MAX_ATR_PCT = 0.080           # 3.0%
 
 # Fibonacci y Confluencias
 USE_FIB = True
@@ -161,11 +161,11 @@ GATE_ATR_RANGE = (MIN_ATR_PCT, MAX_ATR_PCT)
 
 # Scoring (ponderaciones)
 SCORE_W = {
-    "trend_ema200": 2.0,
+    "trend_ema200": 2.2,
     "kumo_trend": 2.0,
     "tenkan_kijun_cross": 1.8,
     "tk_strength": 1.2,          # fuerte/medio/débil
-    "ema20_50_cross": 1.5,
+    "ema20_50_cross": 2.2,       # cruces EMA más relevantes
     "ema_distance": 1.0,
     "rsi_zone": 1.0,
     "volume_ratio": 1.2,
@@ -174,6 +174,7 @@ SCORE_W = {
     "fib_confluence": 1.5,
     "sr_confluence": 0.8,
     "multi_tf_alignment": 1.0,
+    "impulse": 2.0,              # bonus por vela de impulso (H1/H4)
 }
 MIN_SCORE_TO_TRADE = 6.0  # ajustá según selectividad deseada
 
@@ -187,11 +188,30 @@ PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
 # Intervalo entre escaneos
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
 # Estado runtime (cooldown y límites diarios)
 _last_trade_time: Dict[str, float] = {}           # clave: f"{symbol}:{timeframe}"
 _daily_trade_count: Dict[str, int] = {}           # clave día YYYY-MM-DD
+
+# ====== Impulsos (sensibilidad H1 / H4) ======
+IMPULSE_ENABLED = True
+IMPULSE_TFS = ["1h", "4h"]
+IMPULSE_BODY_ATR_MULT = 1.0      # cuerpo >= 1.0x ATR (más sensible)
+IMPULSE_MIN_BODY_PCT = 0.50      # cuerpo >= 50% del rango
+IMPULSE_BREAK_LOOKBACK = 12      # rompe HH/LL de N velas previas (más corto)
+IMPULSE_MIN_VOL_RATIO = 1.00     # volumen >= 1.0x promedio 20
+
+# Timeframes extra permitidos por símbolo para impulsos (BTC muy líquido)
+IMPULSE_TFS_EXTRA_BY_SYMBOL = {
+    "BTCUSDT": ["5m", "15m", "30m"],
+}
+
+def impulse_tf_allowed(symbol: Optional[str], timeframe: str) -> bool:
+    extra = []
+    if symbol and symbol in IMPULSE_TFS_EXTRA_BY_SYMBOL:
+        extra = IMPULSE_TFS_EXTRA_BY_SYMBOL[symbol]
+    return timeframe in IMPULSE_TFS or timeframe in extra
 
 
 # ================== UTILIDADES ==================
@@ -352,6 +372,51 @@ def last_adx(df: pd.DataFrame, length: int = 14) -> Optional[float]:
     return None
 
 
+def detect_impulse(df: pd.DataFrame, side: str, timeframe: str, symbol: Optional[str] = None) -> Tuple[bool, Dict[str, float]]:
+    """Detecta vela de impulso en H1/H4 con condiciones de cuerpo, ATR, volumen y ruptura.
+    Retorna (is_impulse, metrics).
+    """
+    if not IMPULSE_ENABLED or not impulse_tf_allowed(symbol, timeframe):
+        return False, {}
+    if df is None or len(df) < max(ATR_PERIOD + 2, IMPULSE_BREAK_LOOKBACK + 5):
+        return False, {}
+
+    last = df.iloc[-1]
+    prev_window = df.iloc[-(IMPULSE_BREAK_LOOKBACK+1):-1]
+
+    atr = float(get_atr_series(df).iloc[-1])
+    o, h, l, c = map(float, [last["open"], last["high"], last["low"], last["close"]])
+    rng = max(1e-12, h - l)
+    body = abs(c - o)
+    body_pct = body / rng
+    body_vs_atr = body / max(1e-9, atr)
+
+    vol_now = float(last["volume"]) if "volume" in last else 0.0
+    vol_avg20 = float(df["volume"].tail(20).mean()) if "volume" in df else 0.0
+    vol_ratio = vol_now / vol_avg20 if vol_avg20 > 0 else 0.0
+
+    if side == "LONG":
+        broke = c > float(prev_window["high"].max())
+        dir_ok = c > o
+    else:
+        broke = c < float(prev_window["low"].min())
+        dir_ok = c < o
+
+    is_impulse = (
+        dir_ok and (broke or body_vs_atr >= IMPULSE_BODY_ATR_MULT) and
+        body_pct >= IMPULSE_MIN_BODY_PCT and
+        vol_ratio >= IMPULSE_MIN_VOL_RATIO
+    )
+
+    metrics = {
+        "body_pct": body_pct,
+        "body_vs_atr": body_vs_atr,
+        "vol_ratio": vol_ratio,
+        "broke": float(broke),
+    }
+    return is_impulse, metrics
+
+
 def timeframe_alignment_ok(symbol: str, side: str) -> bool:
     if not TIMEFRAME_ALIGNMENT:
         return True
@@ -502,13 +567,17 @@ def hybrid_gate_and_score(side: str, df: pd.DataFrame, last_row: pd.Series,
     notes["ichi_tk_cross"] = tk_cross
     notes["ichi_strength"] = strength
 
+    # Impulso: puede relajar gates sutilmente
+    impulse = precomputed.get("impulse", False)
     # GATES
-    if GATE_BLOCK_IN_KUMO and where == "inside":
+    if GATE_BLOCK_IN_KUMO and where == "inside" and not impulse:
         return False, 0.0, {"reason": "Precio dentro del Kumo"}
-    if GATE_REQUIRE_ICHI_TREND:
+    if GATE_REQUIRE_ICHI_TREND and not impulse:
         if (side=="LONG" and where=="below") or (side=="SHORT" and where=="above"):
             return False, 0.0, {"reason": "Tendencia Kumo en contra"}
-    if GATE_MIN_EMA_DIST is not None and ema_distance < GATE_MIN_EMA_DIST:
+    # En impulso permitimos EMAs un poco más cerca (80% del umbral)
+    min_ema = GATE_MIN_EMA_DIST * (0.8 if impulse else 1.0)
+    if GATE_MIN_EMA_DIST is not None and ema_distance < min_ema:
         return False, 0.0, {"reason": "EMAs muy juntas"}
     lo, hi = GATE_ATR_RANGE
     if atr_pct_now is not None and not (lo <= atr_pct_now <= hi):
@@ -541,6 +610,9 @@ def hybrid_gate_and_score(side: str, df: pd.DataFrame, last_row: pd.Series,
     score += SCORE_W["fib_confluence"] * (1.0 if (fib_conf >= 1.0) else 0.0)
     score += SCORE_W["sr_confluence"]  * (1.0 if (sr_conf  >= 1.0) else 0.0)
     score += SCORE_W["multi_tf_alignment"] * (1.0 if mtaf_ok else 0.0)
+    if impulse:
+        score += SCORE_W.get("impulse", 0.0) * 1.0
+        notes["impulse"] = True
 
     notes["score"] = score
     return True, score, notes
@@ -588,13 +660,19 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
     # RSI
     rsi_series = ta.rsi(df["close"], length=14)
     rsi = float(rsi_series.iloc[-1])
+    # Impulso puede ampliar levemente el rango permitido
+    tf = str(last_row.get("timeframe", "")) if "timeframe" in last_row else ""
+    sym = str(last_row.get("symbol", "")) if "symbol" in last_row else None
+    is_impulse, imp_metrics = detect_impulse(df, side, tf, sym) if tf else (False, {})
     if side == "LONG":
-        if rsi < RSI_LONG_MIN or rsi > RSI_LONG_MAX:
-            reasons.append(f"❌ RSI fuera de rango LONG ({rsi:.1f} no está {RSI_LONG_MIN}-{RSI_LONG_MAX})")
+        rsi_min, rsi_max = RSI_LONG_MIN - (5 if is_impulse else 0), RSI_LONG_MAX + (3 if is_impulse else 0)
+        if rsi < rsi_min or rsi > rsi_max:
+            reasons.append(f"❌ RSI fuera de rango LONG ({rsi:.1f} no está {rsi_min}-{rsi_max})")
             return {"passed": False, "reasons": reasons, "vol_ratio": vol_ratio, "rsi": rsi}
     else:
-        if rsi < RSI_SHORT_MIN or rsi > RSI_SHORT_MAX:
-            reasons.append(f"❌ RSI fuera de rango SHORT ({rsi:.1f} no está {RSI_SHORT_MIN}-{RSI_SHORT_MAX})")
+        rsi_min, rsi_max = RSI_SHORT_MIN - (3 if is_impulse else 0), RSI_SHORT_MAX + (5 if is_impulse else 0)
+        if rsi < rsi_min or rsi > rsi_max:
+            reasons.append(f"❌ RSI fuera de rango SHORT ({rsi:.1f} no está {rsi_min}-{rsi_max})")
             return {"passed": False, "reasons": reasons, "vol_ratio": vol_ratio, "rsi": rsi}
 
     # Tendencia EMA200 (si se pide)
@@ -615,9 +693,10 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
         reasons.append(f"❌ Pendiente EMA20 baja ({pct(abs(slope20)):.2f}% < {pct(MIN_TREND_SLOPE):.2f}%)")
         return {"passed": False, "reasons": reasons, "vol_ratio": vol_ratio, "rsi": rsi}
 
-    # ATR% dentro de rango
+    # ATR% dentro de rango (flex +10% por impulso fuerte)
     atr_pct_now = atr / price if price > 0 else 0.0
-    if not (MIN_ATR_PCT <= atr_pct_now <= MAX_ATR_PCT):
+    max_atr_allowed = MAX_ATR_PCT * (1.10 if is_impulse else 1.0)
+    if not (MIN_ATR_PCT <= atr_pct_now <= max_atr_allowed):
         reasons.append(f"❌ ATR fuera de rango ({pct(atr_pct_now):.2f}% no en {pct(MIN_ATR_PCT):.2f}-{pct(MAX_ATR_PCT):.2f}%)")
         return {"passed": False, "reasons": reasons}
 
@@ -639,11 +718,13 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
             return {"passed": False, "reasons": reasons}
     if REQUIRE_WICK_REJECTION:
         if side == "LONG" and ana["up_wick_pct"] > MAX_UPWICK_FOR_LONG:
-            reasons.append("❌ Mecha superior excesiva para LONG")
-            return {"passed": False, "reasons": reasons}
+            if not is_impulse:
+                reasons.append("❌ Mecha superior excesiva para LONG")
+                return {"passed": False, "reasons": reasons}
         if side == "SHORT" and ana["down_wick_pct"] > MAX_DOWNWICK_FOR_SHORT:
-            reasons.append("❌ Mecha inferior excesiva para SHORT")
-            return {"passed": False, "reasons": reasons}
+            if not is_impulse:
+                reasons.append("❌ Mecha inferior excesiva para SHORT")
+                return {"passed": False, "reasons": reasons}
     if ana["body_pct"] < MIN_BODY_TO_RANGE:
         reasons.append("❌ Cuerpo pequeño en relación al rango")
         return {"passed": False, "reasons": reasons}
@@ -652,12 +733,14 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
     adx_val = None
     if ADX_FILTER:
         adx_val = last_adx(df, length=14)
-        if adx_val is None:
+        if adx_val is None and not is_impulse:
             reasons.append("❌ ADX no disponible")
             return {"passed": False, "reasons": reasons}
-        if adx_val < ADX_MIN:
-            reasons.append(f"❌ ADX débil ({adx_val:.1f} < {ADX_MIN})")
-            return {"passed": False, "reasons": reasons}
+        if adx_val is not None:
+            min_adx = ADX_MIN * (0.7 if is_impulse else 1.0)
+            if adx_val < min_adx and not is_impulse:
+                reasons.append(f"❌ ADX débil ({adx_val:.1f} < {ADX_MIN})")
+                return {"passed": False, "reasons": reasons}
 
     # Estructura HH/HL
     if STRUCT_REQUIRE_HH_HL:
@@ -728,6 +811,7 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
             "fib_conf": fib_conf,
             "sr_conf": sr_conf,
             "mtaf_ok": mtaf_ok,
+            "impulse": is_impulse,
         }
         ok, score_h, notes = hybrid_gate_and_score(
             side, df, last_row, ema20_series=ema20_series, ema50_series=ema50_series, precomputed=precomputed
@@ -747,6 +831,10 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
             f"✅ Kumo: {notes.get('ichi_where','-')} | TK: {notes.get('ichi_tk_cross', False)} | fuerza: {notes.get('ichi_strength','-')}",
             f"✅ Score: {score_total:.2f}",
         ]
+        if is_impulse:
+            reasons_ok.append(
+                f"✅ Impulso {tf}: cuerpo/ATR={imp_metrics.get('body_vs_atr',0):.2f} | cuerpo%={imp_metrics.get('body_pct',0)*100:.0f}% | vol={imp_metrics.get('vol_ratio',0):.2f}x"
+            )
         return {
             "passed": True,
             "reasons": reasons_ok,
@@ -754,6 +842,7 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
             "rsi": rsi,
             "sl_distance": sl_distance,
             "score": score_total,
+            "impulse": is_impulse,
         }
 
     # Si no se usa híbrido, devolvemos el paquete base
@@ -770,6 +859,7 @@ def check_filters(side: str, df: pd.DataFrame, last_row: pd.Series) -> Dict:
         "vol_ratio": vol_ratio,
         "rsi": rsi,
         "sl_distance": sl_distance,
+        "impulse": is_impulse,
     }
 
 
@@ -828,14 +918,17 @@ def build_levels(side: str, last_row: pd.Series, df: pd.DataFrame, symbol: str, 
         "timeframe": timeframe,
         "fib": fib_info,
         "sr": sr_info[-5:] if sr_info else [],
+        "impulse_flag": bool(last_row.get("impulse", False)),
     }
 
 
 def format_trade_message(symbol: str, side: str, levels: Dict, timeframe: str, traded: bool = False) -> str:
     s = display_symbol(symbol)
     action = "🚀 EJECUTADO" if traded else "👀 SEÑAL"
+    imp = levels.get("impulse_flag", False)
+    imp_txt = " ⚡IMPULSO" if imp else ""
     return (
-        f"{action} {side} — {s} [{timeframe}]\n"
+        f"{action} {side} — {s} [{timeframe}]{imp_txt}\n"
         f"Precio: {levels['price']}\n"
         f"Entrada: {levels['entry_low']} - {levels['entry_high']}\n"
         f"SL: {levels['sl']}\n"
@@ -917,7 +1010,7 @@ def analyze(symbol: str, timeframe: str) -> Optional[Dict]:
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Señal tipo cruce EMA20/EMA50
+    # Señal tipo cruce EMA20/EMA50 (prioridad alta)
     long_signal = (last["EMA20"] > last["EMA50"]) and (prev["EMA20"] <= prev["EMA50"])
     short_signal = (last["EMA20"] < last["EMA50"]) and (prev["EMA20"] >= prev["EMA50"])
 
@@ -936,20 +1029,39 @@ def analyze(symbol: str, timeframe: str) -> Optional[Dict]:
             elif tk_cross_short:
                 side = "SHORT"
 
+    # Fallback final: impulso puro en TF permitidos
+    if side is None and IMPULSE_ENABLED and impulse_tf_allowed(symbol, timeframe):
+        imp_long, _ = detect_impulse(df, "LONG", timeframe, symbol)
+        imp_short, _ = detect_impulse(df, "SHORT", timeframe, symbol)
+        if imp_long and not imp_short:
+            side = "LONG"
+        elif imp_short and not imp_long:
+            side = "SHORT"
+        elif imp_long and imp_short:
+            # desambiguar por dirección del cuerpo
+            side = "LONG" if float(last["close"]) > float(last["open"]) else "SHORT"
+
     if side is None:
         return None
 
-    # Alineación multi-timeframe
-    if TIMEFRAME_ALIGNMENT and not timeframe_alignment_ok(symbol, side):
+    # Alineación multi-timeframe (no bloquear si hay impulso fuerte)
+    sim_long, _ = detect_impulse(df, "LONG", timeframe, symbol)
+    sim_short, _ = detect_impulse(df, "SHORT", timeframe, symbol)
+    strong_impulse = sim_long or sim_short
+    if TIMEFRAME_ALIGNMENT and not strong_impulse and not timeframe_alignment_ok(symbol, side):
         return None
 
     # Filtros Haack (inyectamos symbol para funding)
     last = last.copy()
     last["symbol"] = symbol
+    last["timeframe"] = timeframe
     check = check_filters(side, df, last)
     if not check.get("passed", False):
         return None
 
+    # Marcar impulso en niveles si aplica
+    if check.get("impulse"):
+        last["impulse"] = True
     levels = build_levels(side, last, df, symbol, timeframe)
     return {"symbol": symbol, "side": side, "levels": levels, "metrics": check}
 
@@ -973,6 +1085,7 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
     print(f"   ✅ ADX min: {ADX_MIN} | Estructura HH/HL: {'Sí' if STRUCT_REQUIRE_HH_HL else 'No'}")
     print(f"   ✅ Alineación TF: {'Sí' if TIMEFRAME_ALIGNMENT else 'No'} -> {', '.join(ALIGN_WITH) if TIMEFRAME_ALIGNMENT else '-'}")
     print(f"   ✅ Ichimoku: {'ON' if USE_ICHI else 'OFF'} | Híbrido: {'ON' if USE_HYBRID else 'OFF'}")
+    print(f"   ✅ Prioridad a cruces EMA20/EMA50; sensibilidad a impulsos en 1h/4h")
     print("="*60)
 
     total_signals = 0
@@ -985,6 +1098,17 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
             for timeframe in TIMEFRAMES:
                 signal = analyze(symbol, timeframe)
                 if not signal:
+                    # Diagnóstico: verificar impulsos perdidos en BTCUSDT
+                    if symbol == "BTCUSDT" and timeframe in ("1h", "4h"):
+                        try:
+                            dfd = cached_klines(symbol, timeframe, limit=300)
+                            if dfd is not None and not dfd.empty:
+                                impL, mL = detect_impulse(dfd, "LONG", timeframe, symbol)
+                                impS, mS = detect_impulse(dfd, "SHORT", timeframe, symbol)
+                                if impL or impS:
+                                    print(f"      · BTCUSDT {timeframe} IMPULSO detectado (no pasó filtros): LONG={impL} SHORT={impS} | metrics={mL if impL else mS}")
+                        except Exception:
+                            pass
                     time.sleep(0.05)
                     continue
 
@@ -1000,8 +1124,9 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
                 sc = signal.get("metrics", {}).get("score")
                 fibtxt = "FIB" if lv.get("fib") else "-"
                 srtxt = f"SRx{len(lv.get('sr', []))}" if lv.get("sr") else "-"
+                imp_txt = " ⚡" if lv.get("impulse_flag") else ""
                 per_symbol_details.append(
-                    f"[{timeframe}] {signal['side']} | Precio: {lv['price']} | SL: {lv['sl']} (-{sl_pct:.2f}%) | ATR: {atr_val:.4f} | TP: {lv['tp1']} / {lv['tp2']} / {lv['tp3']} | Score: {sc if sc is not None else '-'} | {fibtxt}/{srtxt}"
+                    f"[{timeframe}] {signal['side']}{imp_txt} | Precio: {lv['price']} | SL: {lv['sl']} (-{sl_pct:.2f}%) | ATR: {atr_val:.4f} | TP: {lv['tp1']} / {lv['tp2']} / {lv['tp3']} | Score: {sc if sc is not None else '-'} | {fibtxt}/{srtxt}"
                 )
 
                 msg = format_trade_message(symbol, signal["side"], signal["levels"], timeframe, traded=False)
@@ -1100,6 +1225,7 @@ def main():
     print(f"   ✅ Tendencia EMA200: {'Requerida' if REQUIRE_EMA200_TREND else 'No requerida'}")
     print(f"   ✅ Ichimoku: Tenkan/Kijun/Kumo/Chikou (params {ICHI_TENKAN},{ICHI_KIJUN},{ICHI_SENKOUB})")
     print(f"   ✅ Score mínimo híbrido: {MIN_SCORE_TO_TRADE:.2f}")
+    print(f"   ⚡ Impulsos activos en: {', '.join(IMPULSE_TFS)} | cuerpo>={int(IMPULSE_MIN_BODY_PCT*100)}% & cuerpo>= {IMPULSE_BODY_ATR_MULT}x ATR & vol>={IMPULSE_MIN_VOL_RATIO}x")
 
     minutes = max(1, int(SCAN_INTERVAL_SECONDS / 60))
     print(f"\n🔄 Escaneando cada {minutes} minutos...\n")

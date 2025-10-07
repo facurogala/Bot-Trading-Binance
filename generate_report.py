@@ -16,6 +16,9 @@ def main():
     parser.add_argument('--bot', help='Filtrar reportes por un bot específico (columna bot)')
     parser.add_argument('--per-bot', action='store_true', help='Generar un reporte por cada bot detectado en la DB')
     parser.add_argument('--sanity', action='store_true', help='Imprimir verificación rápida de trades por bot')
+    parser.add_argument('--since', help='ISO datetime para calcular estadísticas desde ese momento (override de sesión)')
+    parser.add_argument('--start-session', action='store_true', help='Iniciar o reiniciar sesión para --bot desde ahora (baseline)')
+    parser.add_argument('--clear-session', action='store_true', help='Eliminar sesión guardada para --bot')
     parser.add_argument('--quick', action='store_true', help='Mostrar reporte rápido en consola')
     
     args = parser.parse_args()
@@ -41,8 +44,26 @@ def main():
     dashboard = TradingDashboard(args.db)
     db = TradingDatabase(args.db)
     
+    # Gestión de sesión por bot
+    if args.bot and args.start_session:
+        db.start_bot_session(args.bot)
+        print(f"✅ Sesión iniciada para bot '{args.bot}' desde ahora")
+    if args.bot and args.clear_session:
+        db.clear_bot_session(args.bot)
+        print(f"🧹 Sesión eliminada para bot '{args.bot}'")
+    
+    # Parse since (si viene)
+    since_dt = None
+    if args.since:
+        try:
+            from datetime import datetime as _dt
+            since_dt = _dt.fromisoformat(args.since)
+        except Exception:
+            print("⚠️ --since inválido; usar formato ISO YYYY-MM-DDTHH:MM:SS")
+            since_dt = None
+
     # Verificar si hay datos
-    stats = db.get_trade_stats(bot=args.bot)
+    stats = db.get_trade_stats(bot=args.bot, since=since_dt)
     if stats['total_trades'] == 0:
         print("⚠️ No hay trades cerrados en la base de datos")
         print("💡 Ejecuta el bot y espera a que se cierren algunas posiciones")
