@@ -22,13 +22,19 @@ class TradingDashboard:
             'loss': '#ef5350',    # Rojo
             'neutral': '#78909c'  # Gris
         }
+        # Filtro actual de bot para gráficos (None = todos)
+        self._filter_bot = None
     
-    def generate_full_report(self, output_dir: str = "reports"):
-        """Genera un reporte completo con todos los gráficos"""
+    def generate_full_report(self, output_dir: str = "reports", bot: Optional[str] = None):
+        """Genera un reporte completo con todos los gráficos.
+        Si 'bot' se especifica, filtra las estadísticas y trades por ese bot (campo 'notes').
+        """
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
-        print("📊 Generando reporte completo...\n")
+        print("Generando reporte completo...\n")
+        # Guardar filtro de bot para usos internos durante este render
+        self._filter_bot = bot
         
         # Crear figura con múltiples subgráficos
         fig = plt.figure(figsize=(20, 12))
@@ -63,9 +69,12 @@ class TradingDashboard:
         self._plot_summary_metrics(ax7)
         
         # Título general
-        stats = self.db.get_trade_stats()
+        stats = self.db.get_trade_stats(bot=self._filter_bot)
+        title_prefix = f"Dashboard de Trading"
+        if self._filter_bot:
+            title_prefix += f" - Bot: {self._filter_bot}"
         fig.suptitle(
-            f'📈 Dashboard de Trading - Total PnL: ${stats["total_pnl"]:.2f} | Win Rate: {stats["win_rate"]:.1f}%',
+            f'{title_prefix} - Total PnL: ${stats["total_pnl"]:.2f} | Win Rate: {stats["win_rate"]:.1f}%',
             fontsize=16, fontweight='bold'
         )
         
@@ -73,18 +82,18 @@ class TradingDashboard:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(output_dir, f"trading_report_{timestamp}.png")
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
-        print(f"✅ Reporte guardado: {filepath}")
+        print(f"Reporte guardado: {filepath}")
         
         plt.close()
         
         # Generar también reporte de texto
-        self._generate_text_report(output_dir, timestamp)
+        self._generate_text_report(output_dir, timestamp, bot=self._filter_bot)
         
         return filepath
     
     def _plot_equity_curve(self, ax):
         """Gráfico de curva de equity (balance acumulado)"""
-        trades = self.db.get_closed_trades()
+        trades = self.db.get_closed_trades(bot=self._filter_bot)
         
         if not trades:
             ax.text(0.5, 0.5, 'No hay datos suficientes', 
@@ -115,7 +124,7 @@ class TradingDashboard:
     
     def _plot_pnl_distribution(self, ax):
         """Distribución de ganancias y pérdidas"""
-        trades = self.db.get_closed_trades()
+        trades = self.db.get_closed_trades(bot=self._filter_bot)
         
         if not trades:
             ax.text(0.5, 0.5, 'No hay datos', ha='center', va='center', 
@@ -136,7 +145,7 @@ class TradingDashboard:
     
     def _plot_win_rate(self, ax):
         """Gráfico de win rate"""
-        stats = self.db.get_trade_stats()
+        stats = self.db.get_trade_stats(bot=self._filter_bot)
         
         if stats['total_trades'] == 0:
             ax.text(0.5, 0.5, 'No hay datos', ha='center', va='center', 
@@ -159,7 +168,7 @@ class TradingDashboard:
     
     def _plot_trades_by_symbol(self, ax):
         """Gráfico de trades por símbolo"""
-        trades = self.db.get_closed_trades()
+        trades = self.db.get_closed_trades(bot=self._filter_bot)
         
         if not trades:
             ax.text(0.5, 0.5, 'No hay datos', ha='center', va='center', 
@@ -191,7 +200,7 @@ class TradingDashboard:
     
     def _plot_performance_by_timeframe(self, ax):
         """Performance por timeframe"""
-        trades = self.db.get_closed_trades()
+        trades = self.db.get_closed_trades(bot=self._filter_bot)
         
         if not trades:
             ax.text(0.5, 0.5, 'No hay datos', ha='center', va='center', 
@@ -228,7 +237,7 @@ class TradingDashboard:
     
     def _plot_trade_duration(self, ax):
         """Distribución de duración de trades"""
-        trades = self.db.get_closed_trades()
+        trades = self.db.get_closed_trades(bot=self._filter_bot)
         
         if not trades:
             ax.text(0.5, 0.5, 'No hay datos', ha='center', va='center', 
@@ -259,26 +268,26 @@ class TradingDashboard:
     def _plot_summary_metrics(self, ax):
         """Panel con métricas resumen"""
         ax.axis('off')
-        stats = self.db.get_trade_stats()
+        stats = self.db.get_trade_stats(bot=self._filter_bot)
         
         # Preparar texto
         metrics_text = f"""
-RESUMEN DE PERFORMANCE
+RESUMEN DE PERFORMANCE{f' - Bot: {self._filter_bot}' if self._filter_bot else ''}
 
-📊 Total de Trades: {stats['total_trades']}
-✅ Trades Ganadores: {stats['winning_trades']}
-❌ Trades Perdedores: {stats['losing_trades']}
+Total de Trades: {stats['total_trades']}
+Trades Ganadores: {stats['winning_trades']}
+Trades Perdedores: {stats['losing_trades']}
 
-💰 PnL Total: ${stats['total_pnl']:.2f}
-📈 Promedio Ganancia: ${stats['avg_win']:.2f}
-📉 Promedio Pérdida: ${stats['avg_loss']:.2f}
+PnL Total: ${stats['total_pnl']:.2f}
+Promedio Ganancia: ${stats['avg_win']:.2f}
+Promedio Pérdida: ${stats['avg_loss']:.2f}
 
-🏆 Mejor Trade: ${stats['best_trade']:.2f}
-💔 Peor Trade: ${stats['worst_trade']:.2f}
+Mejor Trade: ${stats['best_trade']:.2f}
+Peor Trade: ${stats['worst_trade']:.2f}
 
-⚖️ Profit Factor: {stats['profit_factor']:.2f}
-🎯 Win Rate: {stats['win_rate']:.1f}%
-        """
+Profit Factor: {stats['profit_factor']:.2f}
+Win Rate: {stats['win_rate']:.1f}%
+    """
         
         # Color del fondo según performance
         bg_color = self.colors['profit'] if stats['total_pnl'] > 0 else self.colors['loss']
@@ -288,23 +297,23 @@ RESUMEN DE PERFORMANCE
                fontsize=11, family='monospace',
                bbox=dict(boxstyle='round', facecolor=bg_color, alpha=0.2, pad=1))
     
-    def _generate_text_report(self, output_dir: str, timestamp: str):
-        """Genera reporte en formato texto"""
-        stats = self.db.get_trade_stats()
-        trades = self.db.get_closed_trades(limit=10)
+    def _generate_text_report(self, output_dir: str, timestamp: str, bot: Optional[str] = None):
+        """Genera reporte en formato texto. Si 'bot' se pasa, filtra por ese bot."""
+        stats = self.db.get_trade_stats(bot=bot)
+        trades = self.db.get_closed_trades(limit=10, bot=bot)
         
         report = f"""
 ╔═══════════════════════════════════════════════════════════════╗
 ║              REPORTE DE TRADING - {timestamp}                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-📊 ESTADÍSTICAS GENERALES
+ESTADÍSTICAS GENERALES{(' - Bot: ' + bot) if bot else ''}
 {'='*60}
 Total de Trades:           {stats['total_trades']}
 Trades Ganadores:          {stats['winning_trades']} ({stats['win_rate']:.1f}%)
 Trades Perdedores:         {stats['losing_trades']} ({100-stats['win_rate']:.1f}%)
 
-💰 RENDIMIENTO
+RENDIMIENTO
 {'='*60}
 PnL Total:                 ${stats['total_pnl']:.2f}
 Promedio Ganancia:         ${stats['avg_win']:.2f}
@@ -313,7 +322,7 @@ Mejor Trade:               ${stats['best_trade']:.2f}
 Peor Trade:                ${stats['worst_trade']:.2f}
 Profit Factor:             {stats['profit_factor']:.2f}
 
-📈 ÚLTIMOS 10 TRADES
+ÚLTIMOS 10 TRADES
 {'='*60}
 """
         
@@ -335,15 +344,38 @@ Trade #{i}:
         filepath = os.path.join(output_dir, f"trading_report_{timestamp}.txt")
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(report)
-        
-        print(f"✅ Reporte de texto guardado: {filepath}")
+        print(f"Reporte de texto guardado: {filepath}")
+
+    def generate_per_bot_reports(self, output_dir: str = "reports") -> None:
+        """Genera un reporte completo (png+txt) por cada bot presente en la DB."""
+        bots = self.db.get_distinct_bots()
+        if not bots:
+            print("No hay bots registrados en la base de datos para generar reportes por bot.")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for b in bots:
+            try:
+                print(f"Generando reporte para bot: {b}...")
+                self.generate_full_report(output_dir=output_dir, bot=b)
+            except Exception as e:
+                print(f"No se pudo generar reporte para {b}: {e}")
+
+    def sanity_check_by_bot(self) -> None:
+        """Muestra un resumen rápido por bot para verificar que no 'inventa' trades."""
+        rows = self.db.get_bot_summary()
+        print("\n" + "-"*60)
+        print("SANITY CHECK POR BOT")
+        print("-"*60)
+        for r in rows:
+            print(f"{r['bot']}: trades={r['trades']} | total_pnl={r['total_pnl']:+.2f}")
+        print("-"*60 + "\n")
     
     def plot_symbol_performance(self, symbol: str, output_dir: str = "reports"):
         """Genera gráfico específico para un símbolo"""
         trades = self.db.get_trades_by_symbol(symbol)
         
         if not trades:
-            print(f"⚠️ No hay trades para {symbol}")
+            print(f"No hay trades para {symbol}")
             return
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -416,31 +448,32 @@ Promedio: ${sum(pnls)/len(pnls):.2f}
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"✅ Reporte de {symbol} guardado: {filepath}")
+        print(f"Reporte de {symbol} guardado: {filepath}")
         return filepath
 
 
 # Función para generar reporte rápido
-def generate_quick_report(db_path: str = "trading_history.db"):
-    """Genera un reporte rápido y lo muestra en consola"""
+def generate_quick_report(db_path: str = "trading_history.db", bot: Optional[str] = None):
+    """Genera un reporte rápido y lo muestra en consola. Si 'bot' se indica, filtra por ese bot (campo 'notes')."""
     db = TradingDatabase(db_path)
-    stats = db.get_trade_stats()
+    stats = db.get_trade_stats(bot=bot)
     
     print("\n" + "="*60)
-    print("📊 REPORTE RÁPIDO DE TRADING")
+    title = "REPORTE RÁPIDO DE TRADING" + (f" - Bot: {bot}" if bot else "")
+    print(title)
     print("="*60)
-    print(f"\n💰 PnL Total: ${stats['total_pnl']:.2f}")
-    print(f"📊 Total Trades: {stats['total_trades']}")
-    print(f"✅ Win Rate: {stats['win_rate']:.1f}%")
-    print(f"🏆 Mejor Trade: ${stats['best_trade']:.2f}")
-    print(f"💔 Peor Trade: ${stats['worst_trade']:.2f}")
-    print(f"⚖️ Profit Factor: {stats['profit_factor']:.2f}")
+    print(f"\nPnL Total: ${stats['total_pnl']:.2f}")
+    print(f"Total Trades: {stats['total_trades']}")
+    print(f"Win Rate: {stats['win_rate']:.1f}%")
+    print(f"Mejor Trade: ${stats['best_trade']:.2f}")
+    print(f"Peor Trade: ${stats['worst_trade']:.2f}")
+    print(f"Profit Factor: {stats['profit_factor']:.2f}")
     print("="*60 + "\n")
 
 
 # Función de prueba
 if __name__ == "__main__":
-    print("📊 Probando generador de gráficos...\n")
+    print("Probando generador de gráficos...\n")
     
     # Crear dashboard
     dashboard = TradingDashboard("test_trading.db")
@@ -448,10 +481,10 @@ if __name__ == "__main__":
     # Generar reporte completo
     try:
         report_path = dashboard.generate_full_report()
-        print(f"\n✅ Reporte generado exitosamente!")
-        print(f"📁 Ubicación: {report_path}")
+        print(f"\nReporte generado exitosamente!")
+        print(f"Ubicación: {report_path}")
     except Exception as e:
-        print(f"❌ Error al generar reporte: {e}")
+        print(f"Error al generar reporte: {e}")
     
     # Reporte rápido
     generate_quick_report("test_trading.db")

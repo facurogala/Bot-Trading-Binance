@@ -38,7 +38,8 @@ class TradingDatabase:
                 pnl_percent REAL,
                 exit_reason TEXT,
                 timeframe TEXT,
-                notes TEXT
+                notes TEXT,
+                bot TEXT
             )
         ''')
         
@@ -76,6 +77,25 @@ class TradingDatabase:
         ''')
         
         conn.commit()
+        # Migración: asegurar que la columna 'bot' exista si la tabla ya existía
+        try:
+            cursor.execute("PRAGMA table_info(trades)")
+            cols = [r[1] for r in cursor.fetchall()]
+            if 'bot' not in cols:
+                cursor.execute("ALTER TABLE trades ADD COLUMN bot TEXT")
+                conn.commit()
+        except Exception:
+            pass
+
+        # Backfill: si 'bot' es NULL, inferir desde 'notes' para filas históricas
+        try:
+            cursor.execute("UPDATE trades SET bot = 'Haack' WHERE bot IS NULL AND notes LIKE '%Haack%'")
+            cursor.execute("UPDATE trades SET bot = 'Conservador' WHERE bot IS NULL AND notes LIKE '%Conservador%'")
+            cursor.execute("UPDATE trades SET bot = 'Scanner' WHERE bot IS NULL AND (notes LIKE 'Señal EMA - %' OR notes LIKE '%Auto Trading%')")
+            conn.commit()
+        except Exception:
+            pass
+
         conn.close()
         print(f"✅ Base de datos inicializada: {self.db_path}")
     
@@ -89,7 +109,8 @@ class TradingDatabase:
         sl_price: Optional[float] = None,
         tp_prices: Optional[List[float]] = None,
         timeframe: Optional[str] = None,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        bot: Optional[str] = None
     ) -> int:
         """
         Registra una nueva operación
@@ -106,11 +127,11 @@ class TradingDatabase:
         cursor.execute('''
             INSERT INTO trades (
                 symbol, side, entry_price, quantity, leverage, 
-                sl_price, tp_prices, entry_time, status, timeframe, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sl_price, tp_prices, entry_time, status, timeframe, notes, bot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, side, entry_price, quantity, leverage,
-            sl_price, tp_prices_json, entry_time, 'OPEN', timeframe, notes
+            sl_price, tp_prices_json, entry_time, 'OPEN', timeframe, notes, bot
         ))
         
         trade_id = cursor.lastrowid
@@ -223,8 +244,8 @@ class TradingDatabase:
         conn.close()
         return trades
     
-    def get_closed_trades(self, limit: Optional[int] = None) -> List[Dict]:
-        """Obtiene trades cerrados"""
+    def get_closed_trades(self, limit: Optional[int] = None, bot: Optional[str] = None) -> List[Dict]:
+        """Obtiene trades cerrados. Si 'bot' se indica, filtra por la columna 'bot' (fallback: notes LIKE)."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -232,13 +253,18 @@ class TradingDatabase:
         query = '''
             SELECT * FROM trades 
             WHERE status = 'CLOSED'
-            ORDER BY exit_time DESC
         '''
+        params: list = []
+        if bot:
+            # Intentar por columna 'bot'; si hay NULL/"", también considerar notes LIKE como respaldo
+            query += " AND (bot = ? OR (bot IS NULL AND notes LIKE ?))"
+            params.extend([bot, f"%{bot}%"])
+        query += " ORDER BY exit_time DESC"
         
         if limit:
             query += f' LIMIT {limit}'
         
-        cursor.execute(query)
+        cursor.execute(query, params)
         
         trades = []
         for row in cursor.fetchall():
@@ -250,13 +276,19 @@ class TradingDatabase:
         conn.close()
         return trades
     
-    def get_trade_stats(self) -> Dict:
-        """Obtiene estadísticas generales de trading"""
+    def get_trade_stats(self, bot: Optional[str] = None) -> Dict:
+        """Obtiene estadísticas generales de trading. Si 'bot' se indica, filtra por columna 'bot' (fallback: notes LIKE)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        where = "WHERE status = 'CLOSED'"
+        params: list = []
+        if bot:
+            where += " AND (bot = ? OR (bot IS NULL AND notes LIKE ?))"
+            params.extend([bot, f"%{bot}%"])
+        
         # Total de trades
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'CLOSED'")
+        cursor.execute(f"SELECT COUNT(*) FROM trades {where}", params)
         total_trades = cursor.fetchone()[0]
         
         if total_trades == 0:
@@ -275,39 +307,39 @@ class TradingDatabase:
             }
         
         # Trades ganadores
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'CLOSED' AND pnl > 0")
+        cursor.execute(f"SELECT COUNT(*) FROM trades {where} AND pnl > 0", params)
         winning_trades = cursor.fetchone()[0]
         
         # Trades perdedores
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE status = 'CLOSED' AND pnl < 0")
+        cursor.execute(f"SELECT COUNT(*) FROM trades {where} AND pnl < 0", params)
         losing_trades = cursor.fetchone()[0]
         
         # PnL total
-        cursor.execute("SELECT SUM(pnl) FROM trades WHERE status = 'CLOSED'")
+        cursor.execute(f"SELECT SUM(pnl) FROM trades {where}", params)
         total_pnl = cursor.fetchone()[0] or 0
         
         # Promedio de ganancias
-        cursor.execute("SELECT AVG(pnl) FROM trades WHERE status = 'CLOSED' AND pnl > 0")
+        cursor.execute(f"SELECT AVG(pnl) FROM trades {where} AND pnl > 0", params)
         avg_win = cursor.fetchone()[0] or 0
         
         # Promedio de pérdidas
-        cursor.execute("SELECT AVG(pnl) FROM trades WHERE status = 'CLOSED' AND pnl < 0")
+        cursor.execute(f"SELECT AVG(pnl) FROM trades {where} AND pnl < 0", params)
         avg_loss = cursor.fetchone()[0] or 0
         
         # Mejor trade
-        cursor.execute("SELECT MAX(pnl) FROM trades WHERE status = 'CLOSED'")
+        cursor.execute(f"SELECT MAX(pnl) FROM trades {where}", params)
         best_trade = cursor.fetchone()[0] or 0
         
         # Peor trade
-        cursor.execute("SELECT MIN(pnl) FROM trades WHERE status = 'CLOSED'")
+        cursor.execute(f"SELECT MIN(pnl) FROM trades {where}", params)
         worst_trade = cursor.fetchone()[0] or 0
         
         # Ganancias totales
-        cursor.execute("SELECT SUM(pnl) FROM trades WHERE status = 'CLOSED' AND pnl > 0")
+        cursor.execute(f"SELECT SUM(pnl) FROM trades {where} AND pnl > 0", params)
         total_wins = cursor.fetchone()[0] or 0
         
         # Pérdidas totales
-        cursor.execute("SELECT SUM(pnl) FROM trades WHERE status = 'CLOSED' AND pnl < 0")
+        cursor.execute(f"SELECT SUM(pnl) FROM trades {where} AND pnl < 0", params)
         total_losses = abs(cursor.fetchone()[0] or 0)
         
         conn.close()
@@ -384,6 +416,57 @@ class TradingDatabase:
         trades = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return trades
+
+    def get_trades_by_bot(self, bot: str, limit: Optional[int] = None) -> List[Dict]:
+        """Obtiene trades cerrados filtrando por la columna 'bot' (fallback: notes LIKE)."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        query = '''
+            SELECT * FROM trades
+            WHERE status = 'CLOSED' AND (bot = ? OR (bot IS NULL AND notes LIKE ?))
+            ORDER BY exit_time DESC
+        '''
+        if limit:
+            query += f' LIMIT {limit}'
+        cursor.execute(query, (bot, f"%{bot}%"))
+        rows = cursor.fetchall()
+        trades = [dict(r) for r in rows]
+        conn.close()
+        return trades
+
+    def get_distinct_bots(self) -> List[str]:
+        """Devuelve la lista de bots distintos presentes en la base (excluyendo NULL y '')."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT bot FROM trades WHERE bot IS NOT NULL AND bot <> ''")
+        bots = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        return bots
+
+    def get_bot_summary(self) -> List[Dict]:
+        """Resumen por bot: trades, pnl. Incluye totales al final."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COALESCE(bot, 'SIN_BOT') as bot,
+                   COUNT(*) as trades,
+                   SUM(CASE WHEN pnl IS NULL THEN 0 ELSE pnl END) as total_pnl
+            FROM trades
+            WHERE status = 'CLOSED'
+            GROUP BY COALESCE(bot, 'SIN_BOT')
+            ORDER BY trades DESC
+        ''')
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Totales
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl IS NULL THEN 0 ELSE pnl END) FROM trades WHERE status='CLOSED'")
+        t = cursor.fetchone()
+        conn.close()
+        total_trades = t[0] or 0
+        total_pnl = t[1] or 0.0
+        rows.append({"bot": "TOTAL", "trades": total_trades, "total_pnl": total_pnl})
+        return rows
 
 
 # Función de prueba

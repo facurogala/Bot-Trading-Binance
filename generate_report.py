@@ -13,6 +13,9 @@ def main():
     parser.add_argument('--db', default='trading_history.db', help='Ruta de la base de datos')
     parser.add_argument('--output', default='reports', help='Directorio de salida para reportes')
     parser.add_argument('--symbol', help='Generar reporte para un símbolo específico')
+    parser.add_argument('--bot', help='Filtrar reportes por un bot específico (columna bot)')
+    parser.add_argument('--per-bot', action='store_true', help='Generar un reporte por cada bot detectado en la DB')
+    parser.add_argument('--sanity', action='store_true', help='Imprimir verificación rápida de trades por bot')
     parser.add_argument('--quick', action='store_true', help='Mostrar reporte rápido en consola')
     
     args = parser.parse_args()
@@ -31,7 +34,7 @@ def main():
     
     # Reporte rápido
     if args.quick:
-        generate_quick_report(args.db)
+        generate_quick_report(args.db, bot=args.bot)
         return
     
     # Crear dashboard
@@ -39,12 +42,22 @@ def main():
     db = TradingDatabase(args.db)
     
     # Verificar si hay datos
-    stats = db.get_trade_stats()
+    stats = db.get_trade_stats(bot=args.bot)
     if stats['total_trades'] == 0:
         print("⚠️ No hay trades cerrados en la base de datos")
         print("💡 Ejecuta el bot y espera a que se cierren algunas posiciones")
         return
     
+    # Sanity check por bot
+    if args.sanity:
+        dashboard.sanity_check_by_bot()
+        # continuar con otras opciones
+
+    # Reporte por bot automático
+    if args.per_bot:
+        dashboard.generate_per_bot_reports(args.output)
+        return
+
     # Reporte de símbolo específico
     if args.symbol:
         print(f"📈 Generando reporte para {args.symbol}...")
@@ -58,13 +71,13 @@ def main():
     # Reporte completo
     print("📊 Generando reporte completo...")
     try:
-        filepath = dashboard.generate_full_report(args.output)
+        filepath = dashboard.generate_full_report(args.output, bot=args.bot)
         print(f"\n✅ ¡Reporte generado exitosamente!")
         print(f"📁 Archivos guardados en: {args.output}/")
         
         # Mostrar resumen
         print("\n" + "="*60)
-        generate_quick_report(args.db)
+        generate_quick_report(args.db, bot=args.bot)
         
     except Exception as e:
         print(f"❌ Error al generar reporte: {e}")

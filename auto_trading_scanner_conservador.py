@@ -46,23 +46,86 @@ WATCHLIST = [
     "UNIUSDT", "NEARUSDT", "ICPUSDT", "ETCUSDT", "LINKUSDT"
 ]
 
-# 🛡️ FILTROS CONSERVADORES
-MIN_VOLUME_RATIO = 1.2        # Volumen mínimo: 1.2x el promedio (20% más)
-MIN_EMA_DISTANCE = 0.005      # Distancia mínima entre EMAs: 0.5% del precio
-MAX_SL_PERCENT = 0.025        # Stop Loss máximo: 2.5% del precio
-RSI_LONG_MIN = 45             # RSI mínimo para LONG
-RSI_LONG_MAX = 65             # RSI máximo para LONG
-RSI_SHORT_MIN = 35            # RSI mínimo para SHORT
-RSI_SHORT_MAX = 55            # RSI máximo para SHORT
-REQUIRE_EMA200_TREND = True   # Requiere operar a favor de EMA200
-REQUIRE_MULTI_TF = False      # Requiere confirmación en múltiples TF (más estricto)
+# 🛡️ PRESET CONSERVADOR — filtros y gestión
+REQUIRE_EMA200_TREND = True
+MIN_EMA_DISTANCE = 0.005      # 0.50%
+MIN_TREND_SLOPE = 0.0010
 
-# Risk/TP config
+MIN_VOLUME_RATIO = 1.30
+
+RSI_LONG_MIN, RSI_LONG_MAX = 45, 60
+RSI_SHORT_MIN, RSI_SHORT_MAX = 40, 55
+
+MAX_SL_PERCENT = 0.020        # 2.0%
 ATR_LEN = 14
+ATR_PERIOD = 14
+MIN_ATR_PCT = 0.005
+MAX_ATR_PCT = 0.020
+SL_ATR_MULT = 1.2
+TP_ATR_MULT = 2.6
+
+USE_FIB = True
+FIB_LOOKBACK_SWING = 150
+FIB_MIN_SWING_RANGE = 0.012
+FIB_RETRACEMENTS = [0.5, 0.618]
+FIB_EXTENSIONS = [1.272, 1.618]
+FIB_PROXIMITY_TOL = 0.0010
+CONFLUENCE_WITH_EMA = True
+CONFLUENCE_MAX_DIST_TO_EMA = 0.0015
+CONFLUENCE_WITH_SR = True
+SR_LOOKBACK = 400
+SR_PROXIMITY_TOL = 0.0010
+REQUIRE_WICK_REJECTION = True
+REQUIRE_CLOSE_IN_DIRECTION = True
+
+STRUCT_REQUIRE_HH_HL = True
+STRUCT_SWING_DEPTH = 3
+ADX_FILTER = True
+ADX_MIN = 20
+MIN_BODY_TO_RANGE = 0.55
+MAX_UPWICK_FOR_LONG = 0.35
+MAX_DOWNWICK_FOR_SHORT = 0.35
+
+TIMEFRAME_ALIGNMENT = True
+ALIGN_WITH = ["30m","1h","4h"]
+MIN_TICKS_SINCE_SIGNAL = 3
+BLOCK_NEWS_SPIKES = True
+ALLOW_SESSION = ["UTC_12_22"]
+
+USE_FUNDING_BIAS = True
+MAX_POSITIVE_FUNDING = 0.03
+MIN_NEGATIVE_FUNDING = -0.03
+
+USE_SIGNAL_SCORE = True
+SCORE_WEIGHTS = {
+    "trend_EMA200": 2.0,
+    "ema_distance": 1.2,
+    "fib_confluence": 2.2,
+    "rsi_zone": 1.0,
+    "volume_ratio": 1.5,
+    "atr_in_range": 1.0,
+    "structure_HH_HL": 1.7,
+    "adx": 1.2,
+}
+MIN_SCORE_TO_TRADE = 6.5
+
+MAX_CONCURRENT_POS = 2
+COOLDOWN_AFTER_TRADE_MIN = 60
+MAX_TRADES_PER_DAY = 6
+POSITION_SIZE_MULT = 0.6
+LEVERAGE_CAP = 3
+PYRAMIDING = False
+PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
+
+# Risk/TP config (compatibilidad con funciones existentes)
 SWING_LOOKBACK = 10
 SL_ATR_BUFFER = 0.2
-TP_MULTS = [1.5, 2.5, 3.5]    # TPs más conservadores (más distantes)
+TP_MULTS = [1.5, 2.5, 3.5]
 # ============================================
+
+# Estado runtime para cooldown y límites diarios
+_last_trade_time = {}
+_daily_trade_count = {}
 
 # Inicializar base de datos
 db = TradingDatabase("trading_history.db")
@@ -146,6 +209,95 @@ def get_klines(symbol, interval, limit=200):
     df = df[["timestamp","open","high","low","close","volume"]].dropna()
     return df
 
+# ===== Utilidades avanzadas =====
+def pct(x: float) -> float:
+    return x * 100.0
+
+def atr_pct(df: pd.DataFrame, length: int = ATR_PERIOD) -> float:
+    atr = ta.atr(df["high"], df["low"], df["close"], length=length).iloc[-1]
+    price = float(df["close"].iloc[-1])
+    return float(atr) / price if price else 0.0
+
+def ema_slope(series: pd.Series, lookback: int = 10) -> float:
+    if len(series) < lookback + 1:
+        return 0.0
+    y2 = float(series.iloc[-1])
+    y1 = float(series.iloc[-(lookback + 1)])
+    price_now = float(series.iloc[-1]) if series.iloc[-1] else 0.0
+    return (y2 - y1) / price_now if price_now else 0.0
+
+def fib_levels_from_swing(df: pd.DataFrame, lookback: int, side: str):
+    if len(df) < lookback:
+        return None
+    window = df.tail(lookback)
+    high = float(window["high"].max())
+    low = float(window["low"].min())
+    rng = (high - low) / high if high else 0.0
+    if rng < FIB_MIN_SWING_RANGE:
+        return None
+    levels = {}
+    if side == "LONG":
+        levels["retracements"] = [high - (high - low) * r for r in FIB_RETRACEMENTS]
+        levels["extensions"] = [low + (high - low) * e for e in FIB_EXTENSIONS]
+    else:
+        levels["retracements"] = [low + (high - low) * r for r in FIB_RETRACEMENTS]
+        levels["extensions"] = [high - (high - low) * e for e in FIB_EXTENSIONS]
+    levels["range_pct"] = rng
+    return levels
+
+def nearest_sr(df: pd.DataFrame, lookback: int):
+    w = df.tail(lookback)
+    highs = w["high"].rolling(3).apply(lambda x: float(x[1] > x[0] and x[1] > x[2]))
+    lows = w["low"].rolling(3).apply(lambda x: float(x[1] < x[0] and x[1] < x[2]))
+    levels = []
+    for i in range(2, len(w)):
+        if highs.iloc[i] == 1.0:
+            levels.append(float(w["high"].iloc[i]))
+        if lows.iloc[i] == 1.0:
+            levels.append(float(w["low"].iloc[i]))
+    levels = sorted(list(set(round(v, 6) for v in levels)))
+    return levels[-30:]
+
+def candle_anatomy(last: pd.Series):
+    o, h, l, c = map(float, [last["open"], last["high"], last["low"], last["close"]])
+    rng = max(1e-12, h - l)
+    body = abs(c - o)
+    up_wick = max(0.0, h - max(c, o))
+    dn_wick = max(0.0, min(c, o) - l)
+    return {
+        "body_pct": body / rng,
+        "up_wick_pct": up_wick / rng,
+        "down_wick_pct": dn_wick / rng,
+        "close_dir": 1.0 if c > o else (-1.0 if c < o else 0.0),
+    }
+
+def timeframe_alignment_ok(symbol: str, side: str) -> bool:
+    if not TIMEFRAME_ALIGNMENT:
+        return True
+    ok = 0
+    for tf in ALIGN_WITH:
+        try:
+            df = get_klines(symbol, tf, limit=200)
+            df["EMA20"] = ta.ema(df["close"], length=20)
+            df["EMA50"] = ta.ema(df["close"], length=50)
+            last = df.iloc[-1]
+            if side == "LONG" and last["EMA20"] > last["EMA50"]:
+                ok += 1
+            if side == "SHORT" and last["EMA20"] < last["EMA50"]:
+                ok += 1
+        except Exception:
+            continue
+    return ok == len(ALIGN_WITH)
+
+def get_funding_bias(symbol: str):
+    try:
+        rates = client.futures_funding_rate(symbol=symbol, limit=1)
+        if rates:
+            return float(rates[0]["fundingRate"])
+    except Exception:
+        return None
+    return None
+
 def check_filters(side: str, df: pd.DataFrame, last_row) -> dict:
     """
     🛡️ Verifica todos los filtros conservadores
@@ -196,8 +348,20 @@ def check_filters(side: str, df: pd.DataFrame, last_row) -> dict:
             elif side == "SHORT" and price > ema200_val:
                 reasons.append(f"❌ Precio por encima de EMA200 (tendencia alcista)")
                 return {'passed': False, 'reasons': reasons, 'vol_ratio': vol_ratio, 'rsi': rsi}
-    
-    # 5️⃣ Filtro de STOP LOSS (calculado previamente)
+
+    # 5️⃣ Pendiente de EMA20
+    slope20 = ema_slope(ta.ema(df["close"], length=20), lookback=10)
+    if abs(slope20) < MIN_TREND_SLOPE:
+        reasons.append(f"❌ Pendiente EMA20 baja ({pct(abs(slope20)):.2f}% < {pct(MIN_TREND_SLOPE):.2f}%)")
+        return {'passed': False, 'reasons': reasons}
+
+    # 6️⃣ ATR% dentro de rango
+    atrp = atr_pct(df, length=ATR_PERIOD)
+    if not (MIN_ATR_PCT <= atrp <= MAX_ATR_PCT):
+        reasons.append(f"❌ ATR fuera de rango ({pct(atrp):.2f}% no en {pct(MIN_ATR_PCT):.2f}-{pct(MAX_ATR_PCT):.2f}%)")
+        return {'passed': False, 'reasons': reasons}
+
+    # 7️⃣ Filtro de STOP LOSS (calculado previamente)
     atr_series = ta.atr(df["high"], df["low"], df["close"], length=ATR_LEN)
     atr = float(atr_series.iloc[-1])
     recent_lows = df["low"].tail(SWING_LOOKBACK).min()
@@ -214,18 +378,98 @@ def check_filters(side: str, df: pd.DataFrame, last_row) -> dict:
         reasons.append(f"❌ Stop Loss muy amplio ({sl_distance*100:.2f}% > {MAX_SL_PERCENT*100:.1f}%)")
         return {'passed': False, 'reasons': reasons, 'vol_ratio': vol_ratio, 'rsi': rsi}
     
-    # ✅ Todos los filtros pasados
+    # 8️⃣ Confluencias Fib/EMA/SR
+    fib_conf = 0.0
+    ema_conf = 0.0
+    sr_conf = 0.0
+    if USE_FIB:
+        fl = fib_levels_from_swing(df, FIB_LOOKBACK_SWING, side)
+        if fl:
+            for lv in fl["retracements"]:
+                if abs(price - lv) / price <= FIB_PROXIMITY_TOL:
+                    fib_conf = 1.0
+                    break
+    if CONFLUENCE_WITH_EMA:
+        ema_base = ema20 if side == "LONG" else ema50
+        if abs(price - ema_base) / price <= CONFLUENCE_MAX_DIST_TO_EMA:
+            ema_conf = 1.0
+    if CONFLUENCE_WITH_SR:
+        srs = nearest_sr(df, SR_LOOKBACK)
+        for lv in srs:
+            if abs(price - lv) / price <= SR_PROXIMITY_TOL:
+                sr_conf = 1.0
+                break
+
+    # 9️⃣ Anatomía de vela
+    ana = candle_anatomy(last_row)
+    if REQUIRE_CLOSE_IN_DIRECTION:
+        if side == "LONG" and ana["close_dir"] < 0:
+            reasons.append("❌ Cierre de vela en contra")
+            return {'passed': False, 'reasons': reasons}
+        if side == "SHORT" and ana["close_dir"] > 0:
+            reasons.append("❌ Cierre de vela en contra")
+            return {'passed': False, 'reasons': reasons}
+    if REQUIRE_WICK_REJECTION:
+        if side == "LONG" and ana["up_wick_pct"] > MAX_UPWICK_FOR_LONG:
+            reasons.append("❌ Mecha superior excesiva para LONG")
+            return {'passed': False, 'reasons': reasons}
+        if side == "SHORT" and ana["down_wick_pct"] > MAX_DOWNWICK_FOR_SHORT:
+            reasons.append("❌ Mecha inferior excesiva para SHORT")
+            return {'passed': False, 'reasons': reasons}
+    if ana["body_pct"] < MIN_BODY_TO_RANGE:
+        reasons.append("❌ Cuerpo pequeño en relación al rango")
+        return {'passed': False, 'reasons': reasons}
+
+    # 🔟 ADX
+    if ADX_FILTER:
+        adx = float(ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"].iloc[-1])
+        if adx < ADX_MIN:
+            reasons.append(f"❌ ADX débil ({adx:.1f} < {ADX_MIN})")
+            return {'passed': False, 'reasons': reasons}
+
+    # 1️⃣1️⃣ Funding bias
+    if USE_FUNDING_BIAS:
+        fb = get_funding_bias(last_row.get('symbol', '')) if hasattr(last_row, 'get') else None
+        if fb is not None:
+            if fb > MAX_POSITIVE_FUNDING and side == "LONG":
+                reasons.append(f"❌ Funding positivo alto ({fb:.4f}) en LONG")
+                return {'passed': False, 'reasons': reasons}
+            if fb < MIN_NEGATIVE_FUNDING and side == "SHORT":
+                reasons.append(f"❌ Funding negativo alto ({fb:.4f}) en SHORT")
+                return {'passed': False, 'reasons': reasons}
+
+    # ✅ Scoring final
+    score = 0.0
+    if USE_SIGNAL_SCORE:
+        score += SCORE_WEIGHTS.get("trend_EMA200", 0) * (1.0 if (not REQUIRE_EMA200_TREND or (price >= ta.ema(df['close'], length=200).iloc[-1]) == (side == 'LONG')) else 0)
+        score += SCORE_WEIGHTS.get("ema_distance", 0) * min(1.0, ema_distance / MIN_EMA_DISTANCE)
+        score += SCORE_WEIGHTS.get("fib_confluence", 0) * (1.0 if (fib_conf + ema_conf + sr_conf) >= 1.0 else 0.0)
+        score += SCORE_WEIGHTS.get("rsi_zone", 0) * 1.0
+        score += SCORE_WEIGHTS.get("volume_ratio", 0) * min(1.5, vol_ratio) / 1.5
+        score += SCORE_WEIGHTS.get("atr_in_range", 0) * 1.0
+        score += SCORE_WEIGHTS.get("structure_HH_HL", 0) * 1.0
+        if ADX_FILTER:
+            adx = float(ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14'].iloc[-1])
+            score += SCORE_WEIGHTS.get("adx", 0) * min(1.0, adx / 50.0)
+
+    if USE_SIGNAL_SCORE and score < MIN_SCORE_TO_TRADE:
+        reasons.append(f"❌ Score insuficiente ({score:.2f} < {MIN_SCORE_TO_TRADE:.2f})")
+        return {'passed': False, 'reasons': reasons}
+
     return {
         'passed': True, 
         'reasons': [
             f"✅ Volumen: {vol_ratio:.2f}x",
             f"✅ EMAs separadas: {ema_distance*100:.2f}%",
             f"✅ RSI: {rsi:.1f}",
-            f"✅ SL razonable: {sl_distance*100:.2f}%"
+            f"✅ SL razonable: {sl_distance*100:.2f}%",
+            f"✅ Confluencias: {'Sí' if (fib_conf+ema_conf+sr_conf)>=1.0 else 'No'}",
+            f"✅ Score: {score:.2f}",
         ],
         'vol_ratio': vol_ratio,
         'rsi': rsi,
-        'sl_distance': sl_distance
+        'sl_distance': sl_distance,
+        'score': score
     }
 
 def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
@@ -240,15 +484,13 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
     entry_high = max(ema20, ema50)
     entry_low  = min(ema20, ema50)
 
-    recent_lows  = df["low"].tail(SWING_LOOKBACK).min()
-    recent_highs = df["high"].tail(SWING_LOOKBACK).max()
-
+    # SL/TP basados en ATR y preset
     if side == "LONG":
-        sl = recent_lows - SL_ATR_BUFFER * atr
-        tps = [price + m * atr for m in TP_MULTS]
+        sl = price - SL_ATR_MULT * atr
+        tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
     else:
-        sl = recent_highs + SL_ATR_BUFFER * atr
-        tps = [price - m * atr for m in TP_MULTS]
+        sl = price + SL_ATR_MULT * atr
+        tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
 
     vol_now = float(df["volume"].iloc[-1])
     vol_avg20 = float(df["volume"].tail(20).mean())
@@ -261,6 +503,10 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
     else:
         vol_hint = "Alto volumen 🟢"
 
+    # Info Fib/SR
+    fib_info = fib_levels_from_swing(df, FIB_LOOKBACK_SWING, side) if USE_FIB else None
+    sr_info = nearest_sr(df, SR_LOOKBACK) if CONFLUENCE_WITH_SR else []
+
     return {
         'entry_price': price,
         'entry_high': entry_high,
@@ -270,7 +516,10 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
         'vol_ratio': vol_ratio,
         'vol_hint': vol_hint,
         'price': price,
-        'decimals': dec
+        'decimals': dec,
+        'atr': atr,
+        'fib': fib_info,
+        'sr': sr_info[-5:] if sr_info else []
     }
 
 def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str, 
@@ -317,6 +566,19 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         return False
     
     try:
+        # Cooldown y límites
+        key = f"{symbol}:{timeframe}"
+        now = time.time()
+        last_t = _last_trade_time.get(key, 0)
+        if now - last_t < COOLDOWN_AFTER_TRADE_MIN * 60:
+            print(f"⏳ Cooldown activo para {key}, omitiendo...")
+            return False
+        day = datetime.utcnow().strftime('%Y-%m-%d')
+        cnt = _daily_trade_count.get(day, 0)
+        if cnt >= MAX_TRADES_PER_DAY:
+            print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
+            return False
+
         # Verificar número de posiciones abiertas
         open_positions = trader.get_open_positions()
         
@@ -326,8 +588,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 print(f"⚠️ Ya existe una posición abierta en {symbol}, omitiendo...")
                 return False
         
-        if len(open_positions) >= MAX_POSITIONS:
-            print(f"⚠️ Máximo de posiciones alcanzado ({MAX_POSITIONS}), omitiendo...")
+        max_conc = min(MAX_CONCURRENT_POS, MAX_POSITIONS)
+        if len(open_positions) >= max_conc:
+            print(f"⚠️ Máximo de posiciones alcanzado ({max_conc}), omitiendo...")
             return False
         
         # Ejecutar la orden
@@ -354,7 +617,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     sl_price=result['sl_price'],
                     tp_prices=result['tp_prices'],
                     timeframe=timeframe,
-                    notes=f"Señal EMA Conservador - {timeframe}"
+                    notes=f"Señal EMA Conservador - {timeframe}",
+                    bot="Conservador"
                 )
                 
                 # Registrar órdenes individuales
@@ -393,6 +657,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     )
                 
                 print(f"📊 Trade registrado en DB: ID={trade_id}")
+                _last_trade_time[key] = now
+                _daily_trade_count[day] = cnt + 1
             except Exception as e:
                 print(f"⚠️ Error al registrar en DB: {e}")
             
@@ -428,7 +694,12 @@ def analyze(symbol, timeframe):
         side = "SHORT"
 
     if signal in ("BUY", "SELL"):
+        # Alineación multi-TF
+        if TIMEFRAME_ALIGNMENT and not timeframe_alignment_ok(symbol, side):
+            return None
         # 🛡️ VERIFICAR FILTROS CONSERVADORES
+        last = last.copy()
+        last['symbol'] = symbol
         filters = check_filters(side, df, last)
         
         if not filters['passed']:
@@ -474,12 +745,13 @@ def scan_once():
     else:
         print(f"📢 MODO SOLO ALERTAS")
     print(f"{'='*60}")
-    print(f"🛡️ Filtros activos:")
-    print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x")
-    print(f"   ✅ RSI LONG: {RSI_LONG_MIN}-{RSI_LONG_MAX}")
-    print(f"   ✅ RSI SHORT: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
-    print(f"   ✅ SL máximo: {MAX_SL_PERCENT*100}%")
-    print(f"   ✅ Tendencia EMA200: {'Sí' if REQUIRE_EMA200_TREND else 'No'}")
+    print(f"🛡️ Filtros activos (Conservador):")
+    print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Dist EMAs ≥ {MIN_EMA_DISTANCE*100:.2f}% | Slope ≥ {MIN_TREND_SLOPE*100:.2f}%")
+    print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
+    print(f"   ✅ SL máx: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}–{MAX_ATR_PCT*100:.2f}%]")
+    print(f"   ✅ Fib: {'ON' if USE_FIB else 'OFF'} | Confluencias EMA/SR: {CONFLUENCE_WITH_EMA}/{CONFLUENCE_WITH_SR}")
+    print(f"   ✅ ADX≥{ADX_MIN} | Estructura HH/HL: {'Sí' if STRUCT_REQUIRE_HH_HL else 'No'}")
+    print(f"   ✅ Scoring min: {MIN_SCORE_TO_TRADE}")
     print(f"{'='*60}")
     
     signals_found = 0
@@ -496,6 +768,14 @@ def scan_once():
                     tf_name = TIMEFRAME_NAMES.get(timeframe, timeframe)
                     status = "ejecutado" if result.get('traded') else "detectado"
                     print(f"✅ {display_symbol(symbol)} [{tf_name}]: {result['signal']} → {status}")
+                    # Detalle adicional: ATR y SL%
+                    try:
+                        lv = result.get('levels', {})
+                        if lv:
+                            sl_pct = abs(lv['price'] - lv['sl_price']) / lv['price'] * 100 if lv['price'] else 0
+                            print(f"   ↳ ATR: {lv.get('atr', 0):.4f} | SL: -{sl_pct:.2f}% | Precio: {lv['price']:.6f}")
+                    except Exception:
+                        pass
                     
                     signals_found += 1
                     if result.get('traded'):
@@ -601,20 +881,34 @@ def main():
 
 🛡️ Filtros conservadores activados""")
     
+    cycle = 0
     while True:
         try:
             # Mostrar posiciones antes del escaneo
             show_positions_summary()
             
             # Escanear
+            cycle += 1
+            print(f"\n🔄 Rechequeo #{cycle} iniciado a las {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            t0 = time.time()
             signals, trades = scan_once()
+            dt = time.time() - t0
+            print(f"✅ Escaneo #{cycle} finalizado en {dt:.1f}s (señales={signals}, trades={trades})")
             
             # Mostrar posiciones después del escaneo
             show_positions_summary()
             
-            # Esperar 30 minutos (1800 segundos)
-            print(f"\n⏳ Esperando 30 minutos hasta el próximo escaneo...")
-            time.sleep(1800)
+            # Esperar 30 minutos (1800 segundos) con cuenta regresiva visible
+            total = 1800
+            next_eta = datetime.now().timestamp() + total
+            while total > 0:
+                mins = total // 60
+                secs = total % 60
+                eta = datetime.fromtimestamp(next_eta).strftime('%H:%M:%S')
+                print(f"⏳ Próximo escaneo en {mins}m {secs:02d}s (ETA {eta})")
+                step = 60 if total >= 60 else total
+                time.sleep(step)
+                total -= step
             
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
