@@ -121,20 +121,53 @@ def show_open_orders(trader):
                 symbols_with_orders[symbol] = []
             symbols_with_orders[symbol].append(order)
         
+        from datetime import datetime
+
         for symbol, symbol_orders in symbols_with_orders.items():
             print(f"📊 {symbol} - {len(symbol_orders)} orden(es):")
-            
+            print("   Hora                      | Tipo                 | Orden | Precio       | Monto        | Estado     | Reduce | Post | Condicional | TP/SL | TIF")
+            print("   " + "-"*117)
+
             for order in symbol_orders:
-                order_type = order['type']
-                side = order['side']
-                
-                if order_type == "LIMIT":
-                    print(f"   • {side} {order_type} @ {float(order['price']):.4f}")
-                elif order_type in ["STOP_MARKET", "TAKE_PROFIT_MARKET"]:
-                    print(f"   • {side} {order_type} @ {float(order['stopPrice']):.4f}")
+                order_type = order.get('type', '')
+                side = order.get('side', '')
+
+                # Hora (timestamp si existe)
+                ts = order.get('time') or order.get('updateTime') or order.get('transactTime')
+                if ts:
+                    try:
+                        # Binance retorna ms
+                        dt = datetime.fromtimestamp(int(ts) / 1000)
+                        time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        time_str = str(ts)
                 else:
-                    print(f"   • {side} {order_type}")
-            
+                    time_str = ''
+
+                # Precio y monto
+                price = ''
+                qty = ''
+                if order_type == 'LIMIT':
+                    price = f"{float(order.get('price', 0)):.8f}" if order.get('price') else ''
+                    qty = f"{float(order.get('origQty', order.get('quantity', 0))):.8f}"
+                elif order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
+                    price = f"{float(order.get('stopPrice', 0)):.8f}" if order.get('stopPrice') else ''
+                    qty = f"{float(order.get('origQty', order.get('quantity', 0))):.8f}"
+                else:
+                    price = f"{float(order.get('price', 0)):.8f}" if order.get('price') else ''
+                    qty = f"{float(order.get('origQty', order.get('quantity', 0))):.8f}"
+
+                status = order.get('status', '')
+
+                # Flags
+                reduce_flag = order.get('reduceOnly', False)
+                post_flag = order.get('postOnly', False)
+                tif = order.get('timeInForce', '')
+                conditional = bool(order.get('stopPrice') and float(order.get('stopPrice', 0)) > 0)
+                is_tp_sl = ('TAKE_PROFIT' in order_type) or ('STOP' in order_type)
+
+                print(f"   {time_str:23} | {order_type:20} | {side:5} | {price:11} | {qty:12} | {status:10} | {str(reduce_flag):6} | {str(post_flag):4} | {str(conditional):11} | {str(is_tp_sl):5} | {tif}")
+
             print()
             
     except Exception as e:

@@ -6,6 +6,8 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 import requests
+from trading_database import TradingDatabase
+from trading_dashboard import TradingDashboard, generate_quick_report
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -26,6 +28,38 @@ TP_MULTS = [0.5, 1, 1.5, 2, 2.5, 3]  # múltiplos de ATR para TP1..TP6
 OUT_DIR = "graficos"
 os.makedirs(OUT_DIR, exist_ok=True)
 # ============================================
+
+# Inicializar base de datos
+db = TradingDatabase("trading_history.db")
+
+def generar_reportes_automaticos():
+    """Genera todos los reportes automáticamente después de cada escaneo"""
+    try:
+        print(f"\n{'='*60}")
+        print("📊 GENERANDO REPORTES AUTOMÁTICOS...")
+        print(f"{'='*60}")
+        
+        # Verificar si hay datos en la base de datos
+        stats = db.get_trade_stats()
+        
+        # 1. Reporte rápido en consola
+        print("\n📈 ESTADÍSTICAS RÁPIDAS:")
+        generate_quick_report("trading_history.db")
+        
+        # 2. Generar dashboard completo si hay trades cerrados
+        if stats['total_trades'] > 0:
+            print("\n📊 Generando gráficos completos...")
+            dashboard = TradingDashboard("trading_history.db")
+            dashboard.generate_full_report(output_dir="reports")
+            print("✅ Gráficos guardados en: reports/")
+        else:
+            print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
+            print("   Los gráficos se generarán cuando se cierren posiciones")
+        
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"⚠️ Error al generar reportes: {e}")
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -208,6 +242,9 @@ def main():
     # Export
     pd.DataFrame(results).to_excel(os.path.join(OUT_DIR, "ema_signals.xlsx"), index=False)
     print("\n✅ Resultados guardados en graficos/ema_signals.xlsx")
+    
+    # 📊 GENERAR REPORTES AUTOMÁTICAMENTE
+    generar_reportes_automaticos()
 
 if __name__ == "__main__":
     main()

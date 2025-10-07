@@ -1,12 +1,15 @@
 # 🤖 Bot de Trading Automático - Binance Futures
 
-Bot de trading automático para Binance Futures con detección de señales EMA, ejecución automática de trades, gestión de riesgo y generación automática de reportes estadísticos.
+Bot de trading automático para Binance Futures con detección de señales EMA, ejecución automática de trades, gestión de riesgo adaptativa y reconciliación de órdenes SL/TP.
 
 ## 🚀 Características
 
 - ✅ **Trading Automático**: Ejecuta trades automáticamente en Binance Futures
-- 📊 **Análisis Multi-Timeframe**: Escanea 30m, 1h y 4h simultáneamente
-- 🛡️ **Gestión de Riesgo**: Stop Loss y múltiples Take Profits automáticos
+- 📊 **Análisis Multi-Timeframe**: Escanea múltiples timeframes simultáneamente
+- 🛡️ **Gestión de Riesgo Adaptativa**: SL/TP se ajustan según volatilidad percibida
+- 🔄 **Reconciliación de Órdenes**: Garantiza que SL/TP existan en Binance
+- 👁️ **Monitoreo Continuo**: Verifica órdenes periódicamente y las recrea si faltan
+- 🎯 **Cancelación Recíproca**: Cuando SL o TP se ejecutan, cancela las otras automáticamente
 - 📈 **Reportes Automáticos**: Genera gráficos y estadísticas después de cada escaneo
 - 💰 **Base de Datos**: Registra todas las señales y trades en SQLite
 - 🔔 **Notificaciones Telegram**: Alertas en tiempo real
@@ -47,6 +50,12 @@ USE_MARKET_ORDER=False
 MAX_POSITIONS=3
 LEVERAGE=3
 RISK_PERCENT=1.0
+
+# Reconciliación y Monitoreo de Órdenes
+ENABLE_ORDER_MONITORING=True
+ORDER_MONITOR_DURATION=120
+ORDER_MONITOR_INTERVAL=15
+ORDER_FILL_TIMEOUT=30
 ```
 
 ### 4. Obtener API Keys de Binance Testnet
@@ -129,16 +138,111 @@ python generate_report.py --quick
 python view_stats.py
 ```
 
-## 📁 Estructura del Proyecto
+## � Sistema de Reconciliación de Órdenes SL/TP
+
+### ¿Por qué es importante?
+
+Las órdenes SL/TP **viven en Binance**, no en el bot. Esto significa que:
+- ✅ Funcionan aunque tu PC esté apagado
+- ✅ Se ejecutan incluso si el bot se cae
+- ✅ Protegen tu capital 24/7
+
+### Cómo funciona
+
+1. **Después del fill de entrada**: El bot verifica que la posición existe en Binance
+2. **Crea SL/TP con flags correctos**:
+   - `STOP_MARKET` con `closePosition=True` para SL (closePosition ya implica reduce-only)
+   - `TAKE_PROFIT_MARKET` con `reduceOnly=True` para cada TP
+3. **Reconciliación automática**: Si una orden falta, la recrea (hasta 3 reintentos)
+4. **Monitoreo continuo**: Cada 15s durante 2 minutos verifica que las órdenes existan
+5. **Cancelación recíproca**: Cuando SL o TP se ejecuta, cancela las otras automáticamente
+
+### Configuración de Reconciliación
+
+En `.env`:
+
+```env
+# Habilitar monitoreo automático
+ENABLE_ORDER_MONITORING=True
+
+# Duración del monitoreo (segundos)
+ORDER_MONITOR_DURATION=120
+
+# Intervalo de verificación (segundos)
+ORDER_MONITOR_INTERVAL=15
+
+# Timeout para fill de órdenes LIMIT (segundos)
+ORDER_FILL_TIMEOUT=30
+```
+
+### Verificar Órdenes en Binance
+
+```bash
+# Ver todas las órdenes de un símbolo
+python debug_orders.py BTCUSDT
+
+# Ver posiciones y órdenes activas
+python manage_positions.py
+```
+
+## 📊 Gestión de Riesgo Adaptativa
+
+El bot ajusta automáticamente SL y TP según:
+
+### 1. Volatilidad (vol_ratio)
+- **Alta volatilidad (>1.5x)**: SL más amplio, permite respirar al precio
+- **Volatilidad normal (0.8-1.5x)**: SL estándar
+- **Baja volatilidad (<0.8x)**: SL más ajustado (mínimo 0.7x)
+
+### 2. Take Profits basados en Risk-Reward
+- TPs se calculan como múltiplos de la distancia del SL
+- Por defecto: TP1=1:1, TP2=1.5:1, TP3=2:1
+- Ejemplo: Si SL está a 2%, TP1=2%, TP2=3%, TP3=4%
+
+### Ejemplo de Niveles
+
+```
+Precio: $50,000
+ATR: $500
+Volatilidad: 1.5x (alta)
+
+SL: $49,200 (-1.6%, ampliado por volatilidad)
+TP1: $50,800 (+1.6%, ratio 1:1)
+TP2: $51,200 (+2.4%, ratio 1.5:1)
+TP3: $51,600 (+3.2%, ratio 2:1)
+```
+
+## 🧪 Probar en Testnet
+
+### Script de Prueba Completo
+
+```bash
+# Abre una posición MARKET, crea SL/TP, y verifica
+python test_trade_complete.py BTCUSDT LONG
+python test_trade_complete.py ADAUSDT SHORT
+```
+
+Este script:
+1. Calcula niveles dinámicos
+2. Abre posición MARKET
+3. Crea SL/TP con reconciliación
+4. Muestra los Order IDs
+5. Ejecuta debug para verificar en Binance
+6. Inicia monitoreo automático
+
+## �📁 Estructura del Proyecto
 
 ```
 Automatizacion/
 ├── auto_trading_scanner_conservador.py  # Bot con filtros conservadores
 ├── auto_trading_scanner.py              # Bot normal
-├── binance_futures_trader.py            # Módulo de trading
+├── binance_futures_trader.py            # Módulo de trading + reconciliación
+├── order_reconciler.py                  # Sistema de reconciliación de órdenes
 ├── trading_database.py                  # Base de datos SQLite
 ├── trading_dashboard.py                 # Generador de gráficos
 ├── generate_report.py                   # Script de reportes
+├── test_trade_complete.py               # Test completo de trading
+├── debug_orders.py                      # Diagnóstico de órdenes
 ├── view_stats.py                        # Visualizador de estadísticas
 ├── monitor_trading.py                   # Monitor de posiciones
 ├── manage_positions.py                  # Gestión manual de posiciones

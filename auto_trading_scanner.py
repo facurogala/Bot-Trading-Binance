@@ -28,22 +28,46 @@ USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))  # Máximo de posiciones simultáneas
 
 # Múltiples timeframes a analizar
-TIMEFRAMES = ["30m", "1h", "4h"]
+TIMEFRAMES = ["3m","5m", "30m", "1h", "2h","4h","6h","12h"]
 TIMEFRAME_NAMES = {
     "30m": "30 minutos",
     "1h": "1 hora",
-    "4h": "4 horas"
+    "2h": "2 horas",
+    "4h": "4 horas",
+    "6h": "6 horas",
+    "12h": "12 horas"
 }
 
 client = Client()
 
-# Cryptos a monitorear (formato Binance sin /)
+# Cryptos a monitorear (formato Binance sin / - Solo pares disponibles en Futures)
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "TRXUSDT",
-    "AVAXUSDT", "POLUSDT", "INJUSDT", "APTUSDT", "OPUSDT", "ARBUSDT",
-    "SEIUSDT", "TIAUSDT", "HBARUSDT", "STRKUSDT", "SUIUSDT",
-    "BNBUSDT", "DOGEUSDT", "TONUSDT", "DOTUSDT", "LTCUSDT",
-    "UNIUSDT", "NEARUSDT", "ICPUSDT", "ETCUSDT", "LINKUSDT"
+    # Top principales
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    # Populares
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "LTCUSDT", "TRXUSDT", "BCHUSDT",
+    # DeFi y Layer 2
+    "UNIUSDT", "NEARUSDT", "FILUSDT", "ETCUSDT",
+    "OPUSDT", "ARBUSDT", "ATOMUSDT", "HBARUSDT",
+    # Nuevos y prometedores
+    "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
+    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT",
+    # Gaming y NFT
+    "FLOWUSDT", "EGLDUSDT", "AXSUSDT", "IMXUSDT",
+    "SANDUSDT", "MANAUSDT", "ENJUSDT", "APEUSDT",
+    # Otros altcoins
+    "QNTUSDT", "DASHUSDT", "COMPUSDT",
+    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
+    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
+    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT",
+    # Adicionales
+    "ZILUSDT", "RVNUSDT", "SSVUSDT",
+    "ALGOUSDT", "CELOUSDT", "YFIUSDT",
+    "BAKEUSDT", "GTCUSDT",
+    "HIGHUSDT", "IOSTUSDT", "KNCUSDT", "LRCUSDT", "MTLUSDT",
+    "OGNUSDT", "ONTUSDT", "RLCUSDT",
+    "STORJUSDT", "VTHOUSDT", "XMRUSDT", "ZECUSDT"
 ]
 
 # Risk/TP config
@@ -154,16 +178,40 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
     recent_lows  = df["low"].tail(SWING_LOOKBACK).min()
     recent_highs = df["high"].tail(SWING_LOOKBACK).max()
 
-    if side == "LONG":
-        sl = recent_lows - SL_ATR_BUFFER * atr
-        tps = [price + m * atr for m in TP_MULTS]
-    else:
-        sl = recent_highs + SL_ATR_BUFFER * atr
-        tps = [price - m * atr for m in TP_MULTS]
-
+    # Calcular vol_ratio PRIMERO (antes de usarlo)
     vol_now = float(df["volume"].iloc[-1])
     vol_avg20 = float(df["volume"].tail(20).mean())
-    vol_ratio = vol_now / vol_avg20 if vol_avg20 > 0 else 0.0
+    vol_ratio = vol_now / vol_avg20 if vol_avg20 > 0 else 1.0
+
+    # Ajustar SL dinámicamente según volatilidad (vol_ratio)
+    # Si vol_ratio > 1 -> ampliar buffer; si <1 -> reducir
+    vol_scale = 1.0
+    if vol_ratio > 1.0:
+        vol_scale = 1.0 + (vol_ratio - 1.0)  # ejemplo: vol_ratio 1.5 => scale 1.5
+    else:
+        vol_scale = max(0.7, vol_ratio)  # no reducir demasiado, mínimo 0.7
+
+    sl_buffer = SL_ATR_BUFFER * vol_scale
+
+    if side == "LONG":
+        sl = recent_lows - sl_buffer * atr
+    else:
+        sl = recent_highs + sl_buffer * atr
+
+    # Calcular TPs en función de la distancia del SL (risk-reward multiples)
+    # Esto hace que los TP dependan del riesgo percibido (SL) y no sólo del ATR fijo
+    try:
+        sl_distance_pct = abs(price - sl) / price if price > 0 else 0.0
+    except Exception:
+        sl_distance_pct = 0.0
+
+    tps = []
+    for m in TP_MULTS:
+        if side == 'LONG':
+            tp = price + (sl_distance_pct * price * m)
+        else:
+            tp = price - (sl_distance_pct * price * m)
+        tps.append(tp)
 
     if vol_ratio < 0.8:
         vol_hint = "Volumen bajo: posible falta de impulso 🟡"
@@ -270,16 +318,17 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 status="FILLED"
             )
             
-            db.add_order(
-                trade_id=trade_id,
-                order_id=str(result['sl_order']['orderId']),
-                order_type="STOP_LOSS",
-                side=result['sl_order']['side'],
-                symbol=symbol,
-                price=result['sl_price'],
-                quantity=result['quantity'],
-                status="NEW"
-            )
+            if result.get('sl_order'):
+                db.add_order(
+                    trade_id=trade_id,
+                    order_id=str(result['sl_order']['orderId']),
+                    order_type="STOP_LOSS",
+                    side=result['sl_order']['side'],
+                    symbol=symbol,
+                    price=result['sl_price'],
+                    quantity=result['quantity'],
+                    status="NEW"
+                )
             
             for i, tp_order in enumerate(result['tp_orders'], 1):
                 db.add_order(
@@ -294,6 +343,20 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             
             # Guardar referencia al trade
             open_trades_registry[symbol] = trade_id
+            
+            # Iniciar monitoreo con el trade_id correcto si el reconciler está disponado
+            if hasattr(trader, 'reconciler') and trader.reconciler:
+                enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+                if enable_monitoring:
+                    monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
+                    monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
+                    
+                    trader.reconciler.start_monitoring(
+                        symbol=symbol,
+                        trade_id=trade_id,
+                        duration_seconds=monitor_duration,
+                        check_interval=monitor_interval
+                    )
             
             print(f"✅ Trade ejecutado y registrado: {symbol} {side} (ID: {trade_id})")
             return True
@@ -521,7 +584,7 @@ def main():
             show_positions_summary()
             
             # Esperar 30 minutos (1800 segundos)
-            print(f"\n⏳ Esperando 30 minutos hasta el próximo escaneo...")
+            print(f"\n⏳ Esperando 5 minutos hasta el próximo escaneo...")
             time.sleep(1800)
             
         except KeyboardInterrupt:
@@ -532,7 +595,7 @@ def main():
             print(f"\n❌ Error crítico: {e}")
             send_telegram(f"❌ Bot error: {e}")
             print("⏳ Reintentando en 5 minutos...")
-            time.sleep(300)
+            time.sleep(120)
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 """
 Módulo de trading automático para Binance Futures
 Maneja la ejecución de órdenes con SL y TP automáticos
+Incluye reconciliación automática de órdenes
 """
 import os
 from binance.client import Client
@@ -16,6 +17,7 @@ class BinanceFuturesTrader:
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET")
         self.testnet = os.getenv("TESTNET", "False").lower() == "true"
+        self.reconciler = None  # Se inicializa después del cliente
         
         if not api_key or not api_secret:
             raise ValueError("❌ Error: BINANCE_API_KEY o BINANCE_API_SECRET no están configurados en .env")
@@ -66,6 +68,15 @@ class BinanceFuturesTrader:
         # Configuración de trading
         self.leverage = int(os.getenv("LEVERAGE", "5"))  # Apalancamiento por defecto
         self.risk_percent = float(os.getenv("RISK_PERCENT", "1.0"))  # % de capital por trade
+        
+        # Inicializar reconciler después de que el cliente esté listo
+        try:
+            from order_reconciler import OrderReconciler
+            self.reconciler = OrderReconciler(self)
+            print("✅ Order Reconciler inicializado")
+        except Exception as e:
+            print(f"⚠️ No se pudo inicializar Order Reconciler: {e}")
+            self.reconciler = None
         
     def get_account_balance(self) -> float:
         """Obtiene el balance disponible en USDT"""
@@ -206,7 +217,9 @@ class BinanceFuturesTrader:
                     type="MARKET",
                     quantity=quantity
                 )
-                actual_entry = float(entry_order['avgPrice'])
+                actual_entry = float(entry_order.get('avgPrice', entry_price_rounded))
+                print(f"✅ Orden de entrada (MARKET) ejecutada: {entry_order.get('orderId')}")
+                order_info = entry_order
             else:
                 entry_order = self.client.futures_create_order(
                     symbol=symbol,
@@ -216,73 +229,145 @@ class BinanceFuturesTrader:
                     quantity=quantity,
                     price=entry_price_rounded
                 )
-                actual_entry = entry_price_rounded
+                print(f"✅ Orden de entrada (LIMIT) creada: {entry_order.get('orderId')} - esperando fill...")
+
+                # Esperar a que la orden LIMIT se llene antes de colocar SL/TP
+                try:
+                    timeout = int(os.getenv('ORDER_FILL_TIMEOUT', '30'))  # segundos
+                    elapsed = 0.0
+                    order_info = None
+                    status = entry_order.get('status', '')
+                    while (status != 'FILLED') and (elapsed < timeout):
+                        time.sleep(0.5)
+                        elapsed += 0.5
+                        try:
+                            order_info = self.client.futures_get_order(symbol=symbol, orderId=entry_order['orderId'])
+                            status = order_info.get('status', '')
+                        except Exception:
+                            # Ignorar y seguir esperando
+                            pass
+
+                    if status != 'FILLED':
+                        print(f"⚠️ Orden de entrada no se llenó en {timeout}s (status={status}). Cancelando orden de entrada.")
+                        try:
+                            self.client.futures_cancel_order(symbol=symbol, orderId=entry_order['orderId'])
+                        except Exception:
+                            pass
+                        return None
+
+                    actual_entry = float(order_info.get('avgPrice', entry_price_rounded)) if order_info else entry_price_rounded
+
+                except Exception as e:
+                    print(f"⚠️ Error al esperar fill de la orden de entrada: {e}")
+                    return None
+
+            # Obtener cantidad real de la posición (para manejar fills/parciales)
+            actual_position_qty = quantity
+            try:
+                positions_info = self.client.futures_position_information(symbol=symbol)
+                for p in positions_info:
+                    if p['symbol'] == symbol:
+                        actual_position_qty = abs(float(p.get('positionAmt', 0)))
+                        break
+            except Exception:
+                # Fallback: mantener la cantidad calculada previamente
+                actual_position_qty = quantity
+
+            # Actualizar quantity usada por el resto del flujo
+            quantity = actual_position_qty
+
+            print(f"\n🔄 Usando reconciliación de órdenes para garantizar SL/TP en Binance...")
             
-            print(f"✅ Orden de entrada ejecutada: {entry_order['orderId']}")
-            
-            # Stop Loss (orden STOP_MARKET)
-            sl_side = "SELL" if side == "LONG" else "BUY"
-            
-            # Redondear SL según precisión
-            symbol_info = self.get_symbol_info(symbol)
-            if symbol_info:
-                price_precision = symbol_info['pricePrecision']
-                sl_price = round(sl_price, price_precision)
-            
-            sl_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=sl_side,
-                type="STOP_MARKET",
-                stopPrice=sl_price,
-                closePosition=True  # Cierra toda la posición
-            )
-            
-            print(f"✅ Stop Loss configurado: {sl_order['orderId']}")
-            
-            # Take Profits (dividir la posición en partes iguales)
+            # Usar el reconciler para garantizar que las órdenes existen
+            sl_order = None
             tp_orders = []
-            if len(tp_prices) > 0:
-                tp_quantity = quantity / len(tp_prices)
+            
+            if self.reconciler:
+                try:
+                    # El reconciler creará las órdenes con los flags correctos
+                    # y verificará que existan, reintentando si es necesario
+                    sl_order, tp_orders = self.reconciler.ensure_orders_exist(
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity,
+                        sl_price=sl_price,
+                        tp_prices=tp_prices,
+                        max_retries=3
+                    )
+                    
+                    if sl_order and len(tp_orders) > 0:
+                        print(f"✅ Reconciliación exitosa: 1 SL + {len(tp_orders)} TP(s)")
+                    else:
+                        print(f"⚠️ Reconciliación parcial: SL={bool(sl_order)}, TPs={len(tp_orders)}")
+                        
+                except Exception as e:
+                    print(f"⚠️ Error en reconciliación: {e}")
+                    # Fallback a método original si falla el reconciler
+                    print("   Intentando método tradicional...")
+                    
+            # Si no hay reconciler o falló, usar método tradicional
+            if not self.reconciler or not sl_order:
+                print("⚠️ Usando creación tradicional de órdenes (sin reconciler)")
                 
-                # Ajustar según step_size
+                # Stop Loss tradicional
+                sl_side = "SELL" if side == "LONG" else "BUY"
                 symbol_info = self.get_symbol_info(symbol)
                 if symbol_info:
-                    for f in symbol_info['filters']:
-                        if f['filterType'] == 'LOT_SIZE':
-                            step_size = float(f['stepSize'])
-                            tp_quantity = self.round_step_size(tp_quantity, step_size)
-                            break
-                
-                tp_side = "SELL" if side == "LONG" else "BUY"
-                
-                # Obtener precisión de precio
-                price_precision = symbol_info.get('pricePrecision', 2) if symbol_info else 2
-                
-                for i, tp_price in enumerate(tp_prices, 1):
-                    try:
-                        # Última TP toma el resto de la posición
-                        if i == len(tp_prices):
-                            remaining_qty = quantity - (tp_quantity * (len(tp_prices) - 1))
-                            use_qty = remaining_qty
-                        else:
-                            use_qty = tp_quantity
-                        
-                        # Redondear TP según precisión
-                        tp_price_rounded = round(tp_price, price_precision)
-                        
-                        tp_order = self.client.futures_create_order(
-                            symbol=symbol,
-                            side=tp_side,
-                            type="TAKE_PROFIT_MARKET",
-                            stopPrice=tp_price_rounded,
-                            quantity=use_qty
-                        )
-                        tp_orders.append(tp_order)
-                        print(f"✅ TP{i} configurado en {tp_price_rounded}: {tp_order['orderId']}")
-                        time.sleep(0.2)  # Pequeña pausa entre órdenes
-                        
-                    except Exception as e:
-                        print(f"⚠️ Error al configurar TP{i}: {e}")
+                    price_precision = symbol_info['pricePrecision']
+                    sl_price = round(sl_price, price_precision)
+
+                try:
+                    sl_order = self.client.futures_create_order(
+                        symbol=symbol,
+                        side=sl_side,
+                        type="STOP_MARKET",
+                        stopPrice=sl_price,
+                        closePosition=True  # No usar reduceOnly con closePosition
+                    )
+                    print(f"✅ Stop Loss configurado: {sl_order.get('orderId')}")
+                except Exception as e:
+                    print(f"⚠️ Error al configurar Stop Loss: {e}")
+                    sl_order = None
+
+                # Take Profits tradicionales
+                if len(tp_prices) > 0 and len(tp_orders) == 0:
+                    tp_quantity = quantity / len(tp_prices) if quantity > 0 else 0
+                    
+                    symbol_info = self.get_symbol_info(symbol)
+                    if symbol_info:
+                        for f in symbol_info['filters']:
+                            if f['filterType'] == 'LOT_SIZE':
+                                step_size = float(f['stepSize'])
+                                tp_quantity = self.round_step_size(tp_quantity, step_size)
+                                break
+
+                    tp_side = "SELL" if side == "LONG" else "BUY"
+                    price_precision = symbol_info.get('pricePrecision', 2) if symbol_info else 2
+
+                    for i, tp_price in enumerate(tp_prices, 1):
+                        try:
+                            if i == len(tp_prices):
+                                remaining_qty = quantity - (tp_quantity * (len(tp_prices) - 1))
+                                use_qty = remaining_qty
+                            else:
+                                use_qty = tp_quantity
+
+                            tp_price_rounded = round(tp_price, price_precision)
+
+                            tp_order = self.client.futures_create_order(
+                                symbol=symbol,
+                                side=tp_side,
+                                type="TAKE_PROFIT_MARKET",
+                                stopPrice=tp_price_rounded,
+                                quantity=use_qty,
+                                reduceOnly=True
+                            )
+                            tp_orders.append(tp_order)
+                            print(f"✅ TP{i} configurado en {tp_price_rounded}: {tp_order.get('orderId')}")
+                            time.sleep(0.2)
+
+                        except Exception as e:
+                            print(f"⚠️ Error al configurar TP{i}: {e}")
             
             result = {
                 'symbol': symbol,
@@ -298,6 +383,22 @@ class BinanceFuturesTrader:
             }
             
             print(f"\n✅ Posición {side} abierta exitosamente en {symbol}")
+            
+            # Iniciar monitoreo en background (opcional, configurar vía env var)
+            enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+            if enable_monitoring and self.reconciler:
+                monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))  # 2 minutos
+                monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))   # cada 15s
+                
+                print(f"👁️ Iniciando monitoreo de órdenes ({monitor_duration}s)...")
+                # Nota: trade_id debería pasarse, pero por ahora usamos 0
+                self.reconciler.start_monitoring(
+                    symbol=symbol,
+                    trade_id=0,  # Esto debería pasarse desde auto_trading_scanner
+                    duration_seconds=monitor_duration,
+                    check_interval=monitor_interval
+                )
+            
             return result
             
         except BinanceAPIException as e:
