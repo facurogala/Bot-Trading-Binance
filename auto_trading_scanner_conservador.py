@@ -37,34 +37,13 @@ TIMEFRAME_NAMES = {
 
 client = Client()
 
-# Cryptos a monitorear (formato Binance sin / - Solo pares disponibles en Futures)
+# Cryptos a monitorear (formato Binance sin /)
 WATCHLIST = [
-    # Top principales
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    # Populares
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "BCHUSDT",
-    # DeFi y Layer 2
-    "UNIUSDT", "NEARUSDT", "FILUSDT", "ETCUSDT",
-    "OPUSDT", "ARBUSDT", "ATOMUSDT", "HBARUSDT",
-    # Nuevos y prometedores
-    "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
-    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT",
-    # Gaming y NFT
-    "FLOWUSDT", "EGLDUSDT", "AXSUSDT", "IMXUSDT",
-    "SANDUSDT", "MANAUSDT", "ENJUSDT", "APEUSDT",
-    # Otros altcoins
-    "QNTUSDT", "DASHUSDT", "COMPUSDT",
-    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
-    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
-    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT",
-    # Adicionales
-    "ZILUSDT", "RVNUSDT", "SSVUSDT",
-    "ALGOUSDT", "CELOUSDT", "YFIUSDT",
-    "BAKEUSDT", "GTCUSDT",
-    "HIGHUSDT", "IOSTUSDT", "KNCUSDT", "LRCUSDT", "MTLUSDT",
-    "OGNUSDT", "ONTUSDT", "RLCUSDT",
-    "STORJUSDT", "VTHOUSDT", "XMRUSDT", "ZECUSDT"
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "TRXUSDT",
+    "AVAXUSDT", "POLUSDT", "INJUSDT", "APTUSDT", "OPUSDT", "ARBUSDT",
+    "SEIUSDT", "TIAUSDT", "HBARUSDT", "STRKUSDT", "SUIUSDT",
+    "BNBUSDT", "DOGEUSDT", "TONUSDT", "DOTUSDT", "LTCUSDT",
+    "UNIUSDT", "NEARUSDT", "ICPUSDT", "ETCUSDT", "LINKUSDT"
 ]
 
 # 🛡️ FILTROS CONSERVADORES
@@ -635,7 +614,7 @@ def main():
             
             # Esperar 30 minutos (1800 segundos)
             print(f"\n⏳ Esperando 30 minutos hasta el próximo escaneo...")
-            time.sleep(300)
+            time.sleep(1800)
             
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
