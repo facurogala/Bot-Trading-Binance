@@ -90,6 +90,115 @@ class TradingDashboard:
         self._generate_text_report(output_dir, timestamp, bot=self._filter_bot)
         
         return filepath
+
+    def generate_consolidated_report(self, output_dir: str = "reports", filename_base: str = "trading_report", bot: Optional[str] = None):
+        """Genera un reporte completo pero guardando SIEMPRE con el mismo nombre (pisa el anterior).
+        Si 'bot' es None, incluye TODOS los bots (reporte unificado).
+        Crea dos archivos:
+          - PNG: {output_dir}/{filename_base}.png
+          - TXT: {output_dir}/{filename_base}.txt
+        """
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Guardar filtro de bot para usos internos durante este render
+        self._filter_bot = bot
+
+        # Crear figura con múltiples subgráficos (idéntico a generate_full_report)
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+
+        ax1 = fig.add_subplot(gs[0, :])
+        self._plot_equity_curve(ax1)
+
+        ax2 = fig.add_subplot(gs[1, 0])
+        self._plot_pnl_distribution(ax2)
+
+        ax3 = fig.add_subplot(gs[1, 1])
+        self._plot_win_rate(ax3)
+
+        ax4 = fig.add_subplot(gs[1, 2])
+        self._plot_trades_by_symbol(ax4)
+
+        ax5 = fig.add_subplot(gs[2, 0])
+        self._plot_performance_by_timeframe(ax5)
+
+        ax6 = fig.add_subplot(gs[2, 1])
+        self._plot_trade_duration(ax6)
+
+        ax7 = fig.add_subplot(gs[2, 2])
+        self._plot_summary_metrics(ax7)
+
+        stats = self.db.get_trade_stats(bot=self._filter_bot)
+        title_prefix = f"Dashboard de Trading"
+        if self._filter_bot:
+            title_prefix += f" - Bot: {self._filter_bot}"
+        fig.suptitle(
+            f'{title_prefix} - Total PnL: ${stats["total_pnl"]:.2f} | Win Rate: {stats["win_rate"]:.1f}%',
+            fontsize=16, fontweight='bold'
+        )
+
+        # Guardado fijo (sin timestamp): pisa el anterior
+        png_path = os.path.join(output_dir, f"{filename_base}.png")
+        plt.savefig(png_path, dpi=300, bbox_inches='tight')
+        print(f"Reporte guardado (consolidado): {png_path}")
+        plt.close()
+
+        # Reporte de texto fijo
+        self._generate_text_report_fixed(output_dir, filename_base, bot=self._filter_bot)
+
+        return png_path
+
+    def _generate_text_report_fixed(self, output_dir: str, filename_base: str, bot: Optional[str] = None):
+        """Versión fija del reporte de texto, pisa el archivo anterior."""
+        stats = self.db.get_trade_stats(bot=bot)
+        trades = self.db.get_closed_trades(limit=10, bot=bot)
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report = f"""
+╔═══════════════════════════════════════════════════════════════╗
+║              REPORTE DE TRADING (CONSOLIDADO)                 ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Generado: {ts}
+
+ESTADÍSTICAS GENERALES{(' - Bot: ' + bot) if bot else ''}
+{'='*60}
+Total de Trades:           {stats['total_trades']}
+Trades Ganadores:          {stats['winning_trades']} ({stats['win_rate']:.1f}%)
+Trades Perdedores:         {stats['losing_trades']} ({100-stats['win_rate']:.1f}%)
+
+RENDIMIENTO
+{'='*60}
+PnL Total:                 ${stats['total_pnl']:.2f}
+Promedio Ganancia:         ${stats['avg_win']:.2f}
+Promedio Pérdida:          ${stats['avg_loss']:.2f}
+Mejor Trade:               ${stats['best_trade']:.2f}
+Peor Trade:                ${stats['worst_trade']:.2f}
+Profit Factor:             {stats['profit_factor']:.2f}
+
+ÚLTIMOS 10 TRADES
+{'='*60}
+"""
+
+        for i, trade in enumerate(trades, 1):
+            pnl_sign = "+" if trade['pnl'] > 0 else ""
+            report += f"""
+Trade #{i}:
+  Símbolo:    {trade['symbol']}
+  Lado:       {trade['side']}
+  Entrada:    ${trade['entry_price']:.2f}
+  Salida:     ${trade['exit_price']:.2f}
+  PnL:        {pnl_sign}${trade['pnl']:.2f} ({pnl_sign}{trade['pnl_percent']:.2f}%)
+  Razón:      {trade['exit_reason']}
+  Timeframe:  {trade.get('timeframe', 'N/A')}
+  Fecha:      {trade['exit_time']}
+"""
+
+        filepath = os.path.join(output_dir, f"{filename_base}.txt")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(report)
+        print(f"Reporte de texto guardado (consolidado): {filepath}")
     
     def _plot_equity_curve(self, ax):
         """Gráfico de curva de equity (balance acumulado)"""

@@ -1,6 +1,6 @@
 """
-Scanner automático con ejecución de trades en Binance Futures
-Detecta señales EMA y ejecuta posiciones automáticamente con SL y TP
+📈 Bot Swing Trading — 1h a 1d (EMA + confluencias)
+Detecta señales swing y ejecuta posiciones automáticamente con SL y TP.
 """
 import os
 import time
@@ -27,15 +27,15 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))  # Máximo de posiciones simultáneas
 
-# Múltiples timeframes a analizar
-TIMEFRAMES = ["3m","5m", "30m", "1h", "2h","4h","6h","12h"]
+# Timeframes Swing
+TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
 TIMEFRAME_NAMES = {
-    "30m": "30 minutos",
     "1h": "1 hora",
     "2h": "2 horas",
     "4h": "4 horas",
     "6h": "6 horas",
-    "12h": "12 horas"
+    "12h": "12 horas",
+    "1d": "1 día",
 }
 
 client = Client()
@@ -70,7 +70,7 @@ WATCHLIST = [
     "STORJUSDT", "VTHOUSDT", "XMRUSDT", "ZECUSDT"
 ]
 
-# ===== PRESET AGRESIVO =====
+# ===== PRESET SWING =====
 # Risk/TP config
 ATR_LEN = 14
 SWING_LOOKBACK = 10
@@ -78,34 +78,34 @@ SL_ATR_BUFFER = 0.2
 TP_MULTS = [1, 1.5, 2]
 
 # Tendencia/EMAs
-REQUIRE_EMA200_TREND = True  # podés poner False si querés contra-tendencia
-MIN_EMA_DISTANCE = 0.0015    # 0.15%
-MIN_TREND_SLOPE = 0.0005
+REQUIRE_EMA200_TREND = True
+MIN_EMA_DISTANCE = 0.0020    # 0.20%
+MIN_TREND_SLOPE = 0.0008
 
 # Volumen
-MIN_VOLUME_RATIO = 1.00
+MIN_VOLUME_RATIO = 0.90
 
 # RSI
-RSI_LONG_MIN, RSI_LONG_MAX = 35, 75
-RSI_SHORT_MIN, RSI_SHORT_MAX = 25, 65
+RSI_LONG_MIN, RSI_LONG_MAX = 40, 70
+RSI_SHORT_MIN, RSI_SHORT_MAX = 30, 60
 
 # Stop/TP / Volatilidad
-MAX_SL_PERCENT   = 0.050    # ≤ 5.0% distancia de SL
+MAX_SL_PERCENT   = 0.060
 ATR_PERIOD = 14
-MIN_ATR_PCT = 0.0025        # 0.25%
-MAX_ATR_PCT = 0.040         # 4.0%
-SL_ATR_MULT = 1.1
-TP_ATR_MULT = 2.2
+MIN_ATR_PCT = 0.0015
+MAX_ATR_PCT = 0.060
+SL_ATR_MULT = 1.2
+TP_ATR_MULT = 2.4
 
 # Fibonacci y Confluencias
 USE_FIB = True
-FIB_LOOKBACK_SWING = 90
-FIB_MIN_SWING_RANGE = 0.008
+FIB_LOOKBACK_SWING = 150
+FIB_MIN_SWING_RANGE = 0.010
 FIB_RETRACEMENTS = [0.382, 0.5, 0.618, 0.786]
 FIB_EXTENSIONS = [1.272, 1.414, 1.618, 2.000]
 FIB_PROXIMITY_TOL = 0.0025
 CONFLUENCE_WITH_EMA = True
-CONFLUENCE_MAX_DIST_TO_EMA = 0.0035
+CONFLUENCE_MAX_DIST_TO_EMA = 0.0030
 CONFLUENCE_WITH_SR = True
 SR_LOOKBACK = 250
 SR_PROXIMITY_TOL = 0.0025
@@ -113,48 +113,48 @@ REQUIRE_WICK_REJECTION = False
 REQUIRE_CLOSE_IN_DIRECTION = True
 
 # Estructura / Momentum
-STRUCT_REQUIRE_HH_HL = False
-STRUCT_SWING_DEPTH = 2
+STRUCT_REQUIRE_HH_HL = True
+STRUCT_SWING_DEPTH = 3
 ADX_FILTER = True
-ADX_MIN = 14
-MIN_BODY_TO_RANGE = 0.40
+ADX_MIN = 18
+MIN_BODY_TO_RANGE = 0.50
 MAX_UPWICK_FOR_LONG = 0.5
 MAX_DOWNWICK_FOR_SHORT = 0.5
 
 # Timing y confirmaciones
-TIMEFRAME_ALIGNMENT = False
-ALIGN_WITH = ["30m"]
-MIN_TICKS_SINCE_SIGNAL = 1
-BLOCK_NEWS_SPIKES = False
+TIMEFRAME_ALIGNMENT = True
+ALIGN_WITH = ["4h", "12h"]
+MIN_TICKS_SINCE_SIGNAL = 2
+BLOCK_NEWS_SPIKES = True
 ALLOW_SESSION = ["UTC_00_24"]
 
 # Perps/Funding
 USE_FUNDING_BIAS = True
-MAX_POSITIVE_FUNDING = 0.08
-MIN_NEGATIVE_FUNDING = -0.08
+MAX_POSITIVE_FUNDING = 0.05
+MIN_NEGATIVE_FUNDING = -0.05
 
 # Score
 USE_SIGNAL_SCORE = True
 SCORE_WEIGHTS = {
-    "trend_EMA200": 1.5,
-    "ema_distance": 0.8,
-    "fib_confluence": 1.8,
-    "rsi_zone": 0.8,
-    "volume_ratio": 1.2,
-    "atr_in_range": 0.8,
-    "structure_HH_HL": 0.8,
-    "adx": 0.8
+    "trend_EMA200": 1.8,
+    "ema_distance": 1.0,
+    "fib_confluence": 2.0,
+    "rsi_zone": 1.0,
+    "volume_ratio": 1.0,
+    "atr_in_range": 1.0,
+    "structure_HH_HL": 1.2,
+    "adx": 1.0
 }
-MIN_SCORE_TO_TRADE = 3.5
+MIN_SCORE_TO_TRADE = 4.0
 
 # Gestión / Frecuencia
-MAX_CONCURRENT_POS = 4
-COOLDOWN_AFTER_TRADE_MIN = 10
-MAX_TRADES_PER_DAY = 18
-POSITION_SIZE_MULT = 1.3
-LEVERAGE_CAP = 8
-PYRAMIDING = True
-PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618, "TP4": 2.000}
+MAX_CONCURRENT_POS = 3
+COOLDOWN_AFTER_TRADE_MIN = 30
+MAX_TRADES_PER_DAY = 10
+POSITION_SIZE_MULT = 1.0
+LEVERAGE_CAP = 5
+PYRAMIDING = False
+PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
 # Estado runtime
 _last_trade_time = {}
@@ -321,10 +321,10 @@ def generar_reportes_automaticos():
         
         # 2. Generar dashboard completo si hay trades cerrados
         if stats['total_trades'] > 0:
-            print("\n📊 Generando gráficos completos...")
+            print("\n📊 Generando gráficos completos (consolidado)...")
             dashboard = TradingDashboard("trading_history.db")
-            dashboard.generate_full_report(output_dir="reports")
-            print("✅ Gráficos guardados en: reports/")
+            dashboard.generate_consolidated_report(output_dir="reports", filename_base="trading_report_all")
+            print("✅ Gráfico consolidado actualizado: reports/trading_report_all.png")
         else:
             print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
             print("   Los gráficos se generarán cuando se cierren posiciones")
@@ -766,7 +766,7 @@ def show_positions_summary():
 
 def main():
     """Loop infinito que escanea cada 30 minutos"""
-    print("🤖 Bot EMA Scanner + Auto Trading iniciado")
+    print("🤖 Bot Swing Trading (EMA) + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
     print(f"📊 Base de datos: trading_history.db")
@@ -789,12 +789,12 @@ def main():
     # Mensaje inicial
     tf_list = ", ".join(TIMEFRAME_NAMES.values())
     mode = "🤖 TRADING AUTOMÁTICO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS"
-    send_telegram(f"""🤖 <b>Bot EMA Auto Trading Iniciado</b>
+    send_telegram(f"""🤖 <b>Bot Swing Auto Trading Iniciado</b>
 
 {mode}
 📊 {len(WATCHLIST)} cryptos
 ⏰ Timeframes: {tf_list}
-🔄 Escaneo cada 30 min""")
+🔄 Escaneo cada 10 min""")
     
     cycle = 0
     while True:
@@ -833,7 +833,7 @@ def main():
             print(f"\n❌ Error crítico: {e}")
             send_telegram(f"❌ Bot error: {e}")
             print("⏳ Reintentando en 5 minutos...")
-            time.sleep(120)
+            time.sleep(600)
 
 if __name__ == "__main__":
     main()

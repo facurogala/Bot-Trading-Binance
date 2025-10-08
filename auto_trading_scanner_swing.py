@@ -1,6 +1,6 @@
 """
-🛡️ Scanner automático con filtros CONSERVADORES para trading seguro
-Versión mejorada con múltiples filtros de confirmación
+🧭 Bot Swing Trading — 1h a 1d
+Versión con múltiples filtros de confirmación orientada a swings limpios.
 """
 import os
 import time
@@ -27,93 +27,105 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 
-# Múltiples timeframes a analizar
-TIMEFRAMES = ["30m", "1h", "4h"]
+# Timeframes Swing
+TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
 TIMEFRAME_NAMES = {
-    "30m": "30 minutos",
     "1h": "1 hora",
-    "4h": "4 horas"
+    "2h": "2 horas",
+    "4h": "4 horas",
+    "6h": "6 horas",
+    "12h": "12 horas",
+    "1d": "1 día",
 }
 
 client = Client()
 
 # Cryptos a monitorear (formato Binance sin /)
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "TRXUSDT",
-    "AVAXUSDT", "POLUSDT", "INJUSDT", "APTUSDT", "OPUSDT", "ARBUSDT",
-    "SEIUSDT", "TIAUSDT", "HBARUSDT", "STRKUSDT", "SUIUSDT",
-    "BNBUSDT", "DOGEUSDT", "TONUSDT", "DOTUSDT", "LTCUSDT",
-    "UNIUSDT", "NEARUSDT", "ICPUSDT", "ETCUSDT", "LINKUSDT"
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "LTCUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "NEARUSDT",
+    "FILUSDT", "ETCUSDT", "OPUSDT", "ARBUSDT", "ATOMUSDT",
+    "HBARUSDT", "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
+    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT", "FLOWUSDT",
+    "EGLDUSDT", "AXSUSDT", "IMXUSDT", "SANDUSDT", "MANAUSDT",
+    "ENJUSDT", "APEUSDT", "QNTUSDT", "DASHUSDT", "COMPUSDT",
+    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
+    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
+    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT", "ZILUSDT",
+    "RVNUSDT", "SSVUSDT", "ALGOUSDT", "CELOUSDT", "YFIUSDT",
+    "BAKEUSDT", "GTCUSDT", "HIGHUSDT", "IOSTUSDT", "KNCUSDT",
+    "LRCUSDT", "MTLUSDT", "OGNUSDT", "ONTUSDT", "STORJUSDT",
 ]
 
-# 🛡️ PRESET CONSERVADOR — filtros y gestión
+# 🧭 PRESET SWING — filtros y gestión
 REQUIRE_EMA200_TREND = True
-MIN_EMA_DISTANCE = 0.005      # 0.50%
-MIN_TREND_SLOPE = 0.0010
+MIN_EMA_DISTANCE = 0.0020      # 0.20%
+MIN_TREND_SLOPE = 0.0008
 
-MIN_VOLUME_RATIO = 1.30
+MIN_VOLUME_RATIO = 0.90
 
-RSI_LONG_MIN, RSI_LONG_MAX = 45, 60
-RSI_SHORT_MIN, RSI_SHORT_MAX = 40, 55
+RSI_LONG_MIN, RSI_LONG_MAX = 40, 70
+RSI_SHORT_MIN, RSI_SHORT_MAX = 30, 60
 
-MAX_SL_PERCENT = 0.020        # 2.0%
+MAX_SL_PERCENT = 0.060        # 6.0%
 ATR_LEN = 14
 ATR_PERIOD = 14
-MIN_ATR_PCT = 0.005
-MAX_ATR_PCT = 0.020
+MIN_ATR_PCT = 0.0015
+MAX_ATR_PCT = 0.060
 SL_ATR_MULT = 1.2
-TP_ATR_MULT = 2.6
+TP_ATR_MULT = 2.4
 
 USE_FIB = True
 FIB_LOOKBACK_SWING = 150
-FIB_MIN_SWING_RANGE = 0.012
+FIB_MIN_SWING_RANGE = 0.010
 FIB_RETRACEMENTS = [0.5, 0.618]
 FIB_EXTENSIONS = [1.272, 1.618]
-FIB_PROXIMITY_TOL = 0.0010
+FIB_PROXIMITY_TOL = 0.0030
 CONFLUENCE_WITH_EMA = True
-CONFLUENCE_MAX_DIST_TO_EMA = 0.0015
+CONFLUENCE_MAX_DIST_TO_EMA = 0.0030
 CONFLUENCE_WITH_SR = True
 SR_LOOKBACK = 400
-SR_PROXIMITY_TOL = 0.0010
+SR_PROXIMITY_TOL = 0.0030
 REQUIRE_WICK_REJECTION = True
 REQUIRE_CLOSE_IN_DIRECTION = True
 
 STRUCT_REQUIRE_HH_HL = True
 STRUCT_SWING_DEPTH = 3
 ADX_FILTER = True
-ADX_MIN = 20
-MIN_BODY_TO_RANGE = 0.55
-MAX_UPWICK_FOR_LONG = 0.35
-MAX_DOWNWICK_FOR_SHORT = 0.35
+ADX_MIN = 18
+MIN_BODY_TO_RANGE = 0.50
+MAX_UPWICK_FOR_LONG = 0.40
+MAX_DOWNWICK_FOR_SHORT = 0.40
 
 TIMEFRAME_ALIGNMENT = True
-ALIGN_WITH = ["30m","1h","4h"]
-MIN_TICKS_SINCE_SIGNAL = 3
+ALIGN_WITH = ["4h","12h"]
+MIN_TICKS_SINCE_SIGNAL = 2
 BLOCK_NEWS_SPIKES = True
-ALLOW_SESSION = ["UTC_12_22"]
+ALLOW_SESSION = ["UTC_00_24"]
 
 USE_FUNDING_BIAS = True
-MAX_POSITIVE_FUNDING = 0.03
-MIN_NEGATIVE_FUNDING = -0.03
+MAX_POSITIVE_FUNDING = 0.05
+MIN_NEGATIVE_FUNDING = -0.05
 
 USE_SIGNAL_SCORE = True
 SCORE_WEIGHTS = {
-    "trend_EMA200": 2.0,
-    "ema_distance": 1.2,
-    "fib_confluence": 2.2,
+    "trend_EMA200": 1.8,
+    "ema_distance": 1.0,
+    "fib_confluence": 2.0,
     "rsi_zone": 1.0,
-    "volume_ratio": 1.5,
+    "volume_ratio": 1.0,
     "atr_in_range": 1.0,
-    "structure_HH_HL": 1.7,
-    "adx": 1.2,
+    "structure_HH_HL": 1.2,
+    "adx": 1.0,
 }
-MIN_SCORE_TO_TRADE = 6.5
+MIN_SCORE_TO_TRADE = 4.2
 
-MAX_CONCURRENT_POS = 2
-COOLDOWN_AFTER_TRADE_MIN = 60
-MAX_TRADES_PER_DAY = 6
-POSITION_SIZE_MULT = 0.6
-LEVERAGE_CAP = 3
+MAX_CONCURRENT_POS = 3
+COOLDOWN_AFTER_TRADE_MIN = 30
+MAX_TRADES_PER_DAY = 10
+POSITION_SIZE_MULT = 1.0
+LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
@@ -157,10 +169,10 @@ def generar_reportes_automaticos():
         
         # 2. Generar dashboard completo si hay trades cerrados
         if stats['total_trades'] > 0:
-            print("\n📊 Generando gráficos completos...")
+            print("\n📊 Generando gráficos completos (consolidado)...")
             dashboard = TradingDashboard("trading_history.db")
-            dashboard.generate_full_report(output_dir="reports")
-            print("✅ Gráficos guardados en: reports/")
+            dashboard.generate_consolidated_report(output_dir="reports", filename_base="trading_report_all")
+            print("✅ Gráfico consolidado actualizado: reports/trading_report_all.png")
         else:
             print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
             print("   Los gráficos se generarán cuando se cierren posiciones")
@@ -530,7 +542,7 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
     dec = levels['decimals']
     fmt = f"{{:.{dec}f}}"
     
-    status = "🛡️ <b>TRADE CONSERVADOR EJECUTADO</b>" if traded else "🛡️ <b>SEÑAL CONSERVADORA</b>"
+    status = "🚀 <b>TRADE SWING EJECUTADO</b>" if traded else "📣 <b>SEÑAL SWING</b>"
     
     entry_str = f"{fmt.format(levels['entry_high'])} - {fmt.format(levels['entry_low'])}"
     tp_lines = "\n".join([f"🟢 TP{i+1}: {fmt.format(t)}" if side == "LONG"
@@ -554,7 +566,7 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
     
     # Agregar info de filtros si está disponible
     if filters and filters.get('passed'):
-        message += "\n\n🛡️ <b>Filtros Conservadores:</b>"
+        message += "\n\n🛡️ <b>Filtros Swing:</b>"
         for reason in filters['reasons']:
             message += f"\n{reason}"
     
@@ -617,8 +629,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     sl_price=result['sl_price'],
                     tp_prices=result['tp_prices'],
                     timeframe=timeframe,
-                    notes=f"Señal EMA Conservador - {timeframe}",
-                    bot="Conservador"
+                    notes=f"Señal EMA Swing - {timeframe}",
+                    bot="Swing"
                 )
                 
                 # Registrar órdenes individuales
@@ -737,7 +749,7 @@ def scan_once():
     """Escanea todas las cryptos en múltiples timeframes"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'='*60}")
-    print(f"🛡️ ESCANEO CONSERVADOR")
+    print(f"🧭 ESCANEO SWING")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
     print(f"📅 {timestamp}")
     if AUTO_TRADE_ENABLED:
@@ -745,7 +757,7 @@ def scan_once():
     else:
         print(f"📢 MODO SOLO ALERTAS")
     print(f"{'='*60}")
-    print(f"🛡️ Filtros activos (Conservador):")
+    print(f"🛡️ Filtros activos (Swing):")
     print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Dist EMAs ≥ {MIN_EMA_DISTANCE*100:.2f}% | Slope ≥ {MIN_TREND_SLOPE*100:.2f}%")
     print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ SL máx: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}–{MAX_ATR_PCT*100:.2f}%]")
@@ -842,7 +854,7 @@ def show_positions_summary():
 
 def main():
     """Loop infinito que escanea cada 30 minutos"""
-    print("🛡️ Bot EMA Scanner CONSERVADOR + Auto Trading iniciado")
+    print("🚀 Bot Swing EMA + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
     print(f"📊 Base de datos: trading_history.db")
@@ -859,7 +871,7 @@ def main():
     else:
         print(f"📢 MODO SOLO ALERTAS (trading desactivado)")
     
-    print(f"\n🛡️ FILTROS CONSERVADORES ACTIVOS:")
+    print(f"\n🛡️ FILTROS SWING ACTIVOS:")
     print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x promedio")
     print(f"   ✅ RSI LONG: {RSI_LONG_MIN}-{RSI_LONG_MAX}")
     print(f"   ✅ RSI SHORT: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
@@ -867,19 +879,19 @@ def main():
     print(f"   ✅ SL máximo: {MAX_SL_PERCENT*100}%")
     print(f"   ✅ Tendencia EMA200: {'Requerida' if REQUIRE_EMA200_TREND else 'No requerida'}")
     
-    print(f"\n🔄 Escaneando cada 30 minutos...\n")
+    print(f"\n🔄 Escaneando cada 15 minutos...\n")
     
     # Mensaje inicial
     tf_list = ", ".join(TIMEFRAME_NAMES.values())
     mode = "🤖 TRADING AUTOMÁTICO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS"
-    send_telegram(f"""🛡️ <b>Bot EMA CONSERVADOR Iniciado</b>
+    send_telegram(f"""🚀 <b>Bot Swing EMA Iniciado</b>
 
 {mode}
 📊 {len(WATCHLIST)} cryptos
 ⏰ Timeframes: {tf_list}
-🔄 Escaneo cada 30 min
+🔄 Escaneo cada 15 min
 
-🛡️ Filtros conservadores activados""")
+🛡️ Filtros Swing activados""")
     
     cycle = 0
     while True:
@@ -898,8 +910,8 @@ def main():
             # Mostrar posiciones después del escaneo
             show_positions_summary()
             
-            # Esperar 30 minutos (1800 segundos) con cuenta regresiva visible
-            total = 1800
+            # Esperar 15 minutos (900 segundos) con cuenta regresiva visible
+            total = 900
             next_eta = datetime.now().timestamp() + total
             while total > 0:
                 mins = total // 60
@@ -912,13 +924,13 @@ def main():
             
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
-            send_telegram("⚠️ Bot EMA CONSERVADOR detenido")
+            send_telegram("⚠️ Bot Swing EMA detenido")
             break
         except Exception as e:
             print(f"\n❌ Error crítico: {e}")
             send_telegram(f"❌ Bot error: {e}")
             print("⏳ Reintentando en 5 minutos...")
-            time.sleep(300)
+            time.sleep(600)
 
 if __name__ == "__main__":
     main()

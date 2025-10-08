@@ -43,15 +43,12 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))  # Haack: hasta 6 posiciones
 
-# 6 timeframes (equilibrio entre reacción y estabilidad)
-TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "4h"]
+# Timeframes generales (enfoque más lento)
+TIMEFRAMES = ["4h", "12h", "1d"]
 TIMEFRAME_NAMES = {
-    "5m": "5 minutos",
-    "15m": "15 minutos",
-    "30m": "30 minutos",
-    "1h": "1 hora",
-    "2h": "2 horas",
     "4h": "4 horas",
+    "12h": "12 horas",
+    "1d": "1 día",
 }
 
 # Cliente binance solo para klines
@@ -127,7 +124,7 @@ MAX_DOWNWICK_FOR_SHORT = 0.4
 
 # Timing y confirmaciones
 TIMEFRAME_ALIGNMENT = True
-ALIGN_WITH = ["30m", "1h"]
+ALIGN_WITH = ["12h", "1d"]
 MIN_TICKS_SINCE_SIGNAL = 2
 BLOCK_NEWS_SPIKES = True
 ALLOW_SESSION = ["UTC_10_24"]
@@ -188,7 +185,7 @@ PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
 # Intervalo entre escaneos
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
 
 # Estado runtime (cooldown y límites diarios)
 _last_trade_time: Dict[str, float] = {}           # clave: f"{symbol}:{timeframe}"
@@ -204,7 +201,7 @@ IMPULSE_MIN_VOL_RATIO = 1.00     # volumen >= 1.0x promedio 20
 
 # Timeframes extra permitidos por símbolo para impulsos (BTC muy líquido)
 IMPULSE_TFS_EXTRA_BY_SYMBOL = {
-    "BTCUSDT": ["5m", "15m", "30m"],
+    "BTCUSDT": ["5m", "15m", "30m", "1h", "2h", "4h", "12h", "1d"],
 }
 
 def impulse_tf_allowed(symbol: Optional[str], timeframe: str) -> bool:
@@ -987,6 +984,7 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             tp_prices=tp_prices,
             timeframe=timeframe,
             notes="Haack",
+            bot="Haack",
         )
 
         _last_trade_time[key] = now
@@ -1162,9 +1160,10 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
     try:
         print("\n📈 Estadísticas rápidas:")
         generate_quick_report("trading_history.db")
-        # Generar gráficos completos si hay trades registrados
+        # Generar gráfico consolidado (pisa el anterior)
         dashboard = TradingDashboard("trading_history.db")
-        dashboard.generate_full_report(output_dir="reports")
+        # Consolidado: un único archivo que se pisa en cada ciclo
+        dashboard.generate_consolidated_report(output_dir="reports", filename_base="trading_report_all")
         print("✅ Reportes actualizados en reports/")
     except Exception as e:
         print(f"⚠️ No se pudieron generar reportes: {e}")
