@@ -7,12 +7,13 @@ import time
 import pandas as pd
 import pandas_ta as ta
 from binance.client import Client
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
+from auto_closer import AutoCloser
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -144,10 +145,17 @@ db = TradingDatabase("trading_history.db")
 
 # Inicializar trader
 trader = None
+auto_closer = None
 if AUTO_TRADE_ENABLED:
     try:
         trader = BinanceFuturesTrader()
         print("✅ Trader de Binance Futures inicializado")
+        # 🧩 Iniciar AutoCloser (cierre completo tras TP/SL)
+        try:
+            auto_closer = AutoCloser(trader, db, bot_name="Swing")
+            auto_closer.start()
+        except Exception as e:
+            print(f"⚠️ AutoCloser no pudo iniciar: {e}")
     except Exception as e:
         print(f"❌ Error al inicializar trader: {e}")
         print("⚠️ El bot funcionará solo en modo alerta (sin trading)")
@@ -585,7 +593,7 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         if now - last_t < COOLDOWN_AFTER_TRADE_MIN * 60:
             print(f"⏳ Cooldown activo para {key}, omitiendo...")
             return False
-        day = datetime.utcnow().strftime('%Y-%m-%d')
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cnt = _daily_trade_count.get(day, 0)
         if cnt >= MAX_TRADES_PER_DAY:
             print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
@@ -634,15 +642,20 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 )
                 
                 # Registrar órdenes individuales
+                entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
+                try:
+                    entry_price_record = float(entry_price_record)
+                except Exception:
+                    entry_price_record = result['entry_price']
                 db.add_order(
                     trade_id=trade_id,
                     order_id=str(result['entry_order']['orderId']),
                     order_type="ENTRY",
                     side=result['entry_order']['side'],
                     symbol=symbol,
-                    price=result['entry_price'],
+                    price=entry_price_record,
                     quantity=result['quantity'],
-                    status="FILLED"
+                    status=result['entry_order'].get('status', 'FILLED')
                 )
                 
                 db.add_order(
@@ -653,19 +666,21 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     symbol=symbol,
                     price=result['sl_price'],
                     quantity=result['quantity'],
-                    status="NEW"
+                    status=result['sl_order'].get('status', 'NEW')
                 )
                 
                 for i, tp_order in enumerate(result['tp_orders'], 1):
+                    tp_price = tp_order.get('stopPrice') or tp_order.get('price') or result['tp_prices'][i-1]
+                    tp_qty = tp_order.get('origQty') or result['quantity']
                     db.add_order(
                         trade_id=trade_id,
                         order_id=str(tp_order['orderId']),
                         order_type=f"TAKE_PROFIT_{i}",
                         side=tp_order['side'],
                         symbol=symbol,
-                        price=tp_order['stopPrice'],
-                        quantity=tp_order['origQty'],
-                        status="NEW"
+                        price=tp_price,
+                        quantity=tp_qty,
+                        status=tp_order.get('status', 'NEW')
                     )
                 
                 print(f"📊 Trade registrado en DB: ID={trade_id}")
@@ -723,6 +738,11 @@ def analyze(symbol, timeframe):
         
         # ✅ Señal aprobada por todos los filtros
         levels = build_levels(side, last, df, symbol, timeframe)
+        # Contabilizar señal aprobada
+        try:
+            db.increment_bot_activity(bot="Swing", approved_delta=1)
+        except Exception:
+            pass
         
         # Intentar ejecutar el trade
         traded = False
@@ -732,6 +752,11 @@ def analyze(symbol, timeframe):
         # Enviar mensaje a Telegram
         message = format_trade_message(symbol, side, levels, timeframe, traded, filters)
         send_telegram(message)
+        if traded:
+            try:
+                db.increment_bot_activity(bot="Swing", executed_delta=1)
+            except Exception:
+                pass
         
         return {
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -925,12 +950,24 @@ def main():
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
             send_telegram("⚠️ Bot Swing EMA detenido")
+            try:
+                if auto_closer:
+                    auto_closer.stop()
+            except Exception:
+                pass
             break
         except Exception as e:
             print(f"\n❌ Error crítico: {e}")
             send_telegram(f"❌ Bot error: {e}")
             print("⏳ Reintentando en 5 minutos...")
             time.sleep(600)
+
+    # Al salir del main loop, asegurar detener AutoCloser
+    try:
+        if auto_closer:
+            auto_closer.stop()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

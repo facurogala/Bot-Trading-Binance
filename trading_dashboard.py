@@ -52,9 +52,12 @@ class TradingDashboard:
         ax3 = fig.add_subplot(gs[1, 1])
         self._plot_win_rate(ax3)
         
-        # 4. Trades por símbolo
+        # 4. Si no hay filtro de bot, mostrar PnL por Bot; si hay filtro, trades por símbolo
         ax4 = fig.add_subplot(gs[1, 2])
-        self._plot_trades_by_symbol(ax4)
+        if self._filter_bot:
+            self._plot_trades_by_symbol(ax4)
+        else:
+            self._plot_pnl_by_bot(ax4)
         
         # 5. Performance por timeframe
         ax5 = fig.add_subplot(gs[2, 0])
@@ -64,9 +67,9 @@ class TradingDashboard:
         ax6 = fig.add_subplot(gs[2, 1])
         self._plot_trade_duration(ax6)
         
-        # 7. Métricas resumen
+        # 7. Inversión promedio por bot (gráfico)
         ax7 = fig.add_subplot(gs[2, 2])
-        self._plot_summary_metrics(ax7)
+        self._plot_avg_investment(ax7)
         
         # Título general
         stats = self.db.get_trade_stats(bot=self._filter_bot)
@@ -118,7 +121,10 @@ class TradingDashboard:
         self._plot_win_rate(ax3)
 
         ax4 = fig.add_subplot(gs[1, 2])
-        self._plot_trades_by_symbol(ax4)
+        if self._filter_bot:
+            self._plot_trades_by_symbol(ax4)
+        else:
+            self._plot_pnl_by_bot(ax4)
 
         ax5 = fig.add_subplot(gs[2, 0])
         self._plot_performance_by_timeframe(ax5)
@@ -127,7 +133,7 @@ class TradingDashboard:
         self._plot_trade_duration(ax6)
 
         ax7 = fig.add_subplot(gs[2, 2])
-        self._plot_summary_metrics(ax7)
+        self._plot_avg_investment(ax7)
 
         stats = self.db.get_trade_stats(bot=self._filter_bot)
         title_prefix = f"Dashboard de Trading"
@@ -177,21 +183,53 @@ Mejor Trade:               ${stats['best_trade']:.2f}
 Peor Trade:                ${stats['worst_trade']:.2f}
 Profit Factor:             {stats['profit_factor']:.2f}
 
+"""
+        report += """
+ACTIVIDAD (PROMEDIO 7 DÍAS)
+============================================================
+"""
+
+        # 7d MA por bot
+        if bot:
+            ma = self.db.get_bot_activity_7d_ma(bot=bot).get(bot, 0.0)
+            report += f"Bot {bot}: {ma:.2f} operac./día\n"
+        else:
+            ma_all = self.db.get_bot_activity_7d_ma()
+            for b, v in ma_all.items():
+                report += f"Bot {b}: {v:.2f} operac./día\n"
+
+        report += f"""
 ÚLTIMOS 10 TRADES
 {'='*60}
 """
 
         for i, trade in enumerate(trades, 1):
             pnl_sign = "+" if trade['pnl'] > 0 else ""
+            # Calcular Price% con signo según el lado
+            try:
+                entry = float(trade['entry_price'])
+                exitp = float(trade['exit_price']) if trade['exit_price'] is not None else None
+                side = str(trade['side']).upper()
+                if exitp is not None and entry:
+                    price_pct = ((exitp - entry) / entry) * 100.0
+                    if side == 'SHORT':
+                        price_pct = -price_pct
+                else:
+                    price_pct = 0.0
+            except Exception:
+                price_pct = 0.0
+            bot_name = trade.get('bot') if isinstance(trade, dict) else None
+            bot_name = bot_name if (bot_name is not None and bot_name != '') else 'N/A'
             report += f"""
 Trade #{i}:
   Símbolo:    {trade['symbol']}
   Lado:       {trade['side']}
   Entrada:    ${trade['entry_price']:.2f}
   Salida:     ${trade['exit_price']:.2f}
-  PnL:        {pnl_sign}${trade['pnl']:.2f} ({pnl_sign}{trade['pnl_percent']:.2f}%)
+  PnL:        {pnl_sign}${trade['pnl']:.2f} (ROE {trade['pnl_percent']:+.2f}% | Price {price_pct:+.2f}%)
   Razón:      {trade['exit_reason']}
   Timeframe:  {trade.get('timeframe', 'N/A')}
+  Bot:        {bot_name}
   Fecha:      {trade['exit_time']}
 """
 
@@ -306,6 +344,34 @@ Trade #{i}:
         ax.set_title('Top 10 Símbolos Más Operados', fontsize=12, fontweight='bold')
         ax.set_xlabel('Número de Trades')
         ax.grid(True, alpha=0.3, axis='x')
+
+    def _plot_pnl_by_bot(self, ax):
+        """Muestra PnL total y cantidad de trades por bot (cuando no hay filtro)."""
+        rows = self.db.get_bot_summary()
+        # Excluir el total agregado
+        bots = [r for r in rows if r.get('bot') not in (None, '', 'TOTAL')]
+        if not bots:
+            ax.text(0.5, 0.5, 'No hay datos por bot', ha='center', va='center', 
+                    transform=ax.transAxes)
+            ax.set_title('PnL por Bot')
+            return
+
+        # Ordenar por PnL
+        bots_sorted = sorted(bots, key=lambda r: r.get('total_pnl', 0), reverse=True)
+        names = [r['bot'] for r in bots_sorted]
+        pnls = [r.get('total_pnl', 0.0) for r in bots_sorted]
+        trades = [r.get('trades', 0) for r in bots_sorted]
+        colors = [self.colors['profit'] if p > 0 else self.colors['loss'] for p in pnls]
+
+        ax.barh(names, pnls, color=colors, alpha=0.8)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+        # Etiquetas con cantidad de trades
+        for i, (y, p, n) in enumerate(zip(names, pnls, trades)):
+            ax.text(p + (0.02 * (max(pnls) if pnls else 1)), i, f'({n})', va='center', fontsize=8)
+
+        ax.set_title('PnL por Bot (n = trades)', fontsize=12, fontweight='bold')
+        ax.set_xlabel('PnL Total ($)')
+        ax.grid(True, alpha=0.3, axis='x')
     
     def _plot_performance_by_timeframe(self, ax):
         """Performance por timeframe"""
@@ -405,6 +471,62 @@ Win Rate: {stats['win_rate']:.1f}%
                ha='center', va='center',
                fontsize=11, family='monospace',
                bbox=dict(boxstyle='round', facecolor=bg_color, alpha=0.2, pad=1))
+
+    def _plot_avg_investment(self, ax):
+        """Gráfico de inversión promedio (notional y riesgo) por bot.
+        Si hay filtro de bot, muestra una tarjeta con sus valores.
+        """
+        if self._filter_bot:
+            # Mostrar tarjeta con valores del bot filtrado
+            ax.axis('off')
+            try:
+                rows = self.db.get_bot_investment_summary(bot=self._filter_bot)
+            except Exception:
+                rows = []
+            if not rows or not rows[0] or rows[0].get('trades', 0) == 0:
+                ax.text(0.5, 0.5, 'Sin datos de inversión', ha='center', va='center', transform=ax.transAxes)
+                ax.set_title('Inversión Promedio (USDT)')
+                return
+            r = rows[0]
+            text = f"""
+{self._filter_bot} — INVERSIÓN PROMEDIO
+
+Notional: ${r.get('avg_notional', 0.0):.2f}
+Riesgo:   ${r.get('avg_risk_usd', 0.0):.2f}
+(n = {r.get('trades', 0)})
+            """
+            ax.text(0.5, 0.5, text.strip(), ha='center', va='center', fontsize=11, family='monospace',
+                    bbox=dict(boxstyle='round', facecolor='#eceff1', alpha=0.5, pad=1))
+            ax.set_title('Inversión Promedio (USDT)')
+            return
+
+        # Gráfico por bot (no filtrado)
+        try:
+            rows = self.db.get_bot_investment_summary()
+        except Exception:
+            rows = []
+        bots = [r.get('bot') or 'SIN_BOT' for r in rows if r.get('trades', 0) > 0 and r.get('avg_notional') is not None]
+        if not bots:
+            ax.text(0.5, 0.5, 'Sin datos de inversión por bot', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Inversión Promedio (USDT) por Bot')
+            return
+
+        avg_notional = [r.get('avg_notional', 0.0) for r in rows if r.get('trades', 0) > 0 and r.get('avg_notional') is not None]
+        avg_risk = [r.get('avg_risk_usd', 0.0) for r in rows if r.get('trades', 0) > 0 and r.get('avg_risk_usd') is not None]
+
+        # Dos barras lado a lado por bot
+        import numpy as np
+        x = np.arange(len(bots))
+        width = 0.35
+        bars1 = ax.bar(x - width/2, avg_notional, width, label='Notional prom ($)', color=self.colors['profit'], alpha=0.8)
+        bars2 = ax.bar(x + width/2, avg_risk, width, label='Riesgo prom ($)', color=self.colors['neutral'], alpha=0.8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(bots, rotation=20)
+        ax.set_title('Inversión Promedio (USDT) por Bot')
+        ax.set_ylabel('USDT')
+        ax.legend()
+        ax.grid(True, alpha=0.2, axis='y')
     
     def _generate_text_report(self, output_dir: str, timestamp: str, bot: Optional[str] = None):
         """Genera reporte en formato texto. Si 'bot' se pasa, filtra por ese bot."""
@@ -437,15 +559,31 @@ Profit Factor:             {stats['profit_factor']:.2f}
         
         for i, trade in enumerate(trades, 1):
             pnl_sign = "+" if trade['pnl'] > 0 else ""
+            # Calcular Price% con signo según el lado
+            try:
+                entry = float(trade['entry_price'])
+                exitp = float(trade['exit_price']) if trade['exit_price'] is not None else None
+                side = str(trade['side']).upper()
+                if exitp is not None and entry:
+                    price_pct = ((exitp - entry) / entry) * 100.0
+                    if side == 'SHORT':
+                        price_pct = -price_pct
+                else:
+                    price_pct = 0.0
+            except Exception:
+                price_pct = 0.0
+            bot_name = trade.get('bot') if isinstance(trade, dict) else None
+            bot_name = bot_name if (bot_name is not None and bot_name != '') else 'N/A'
             report += f"""
 Trade #{i}:
   Símbolo:    {trade['symbol']}
   Lado:       {trade['side']}
   Entrada:    ${trade['entry_price']:.2f}
   Salida:     ${trade['exit_price']:.2f}
-  PnL:        {pnl_sign}${trade['pnl']:.2f} ({pnl_sign}{trade['pnl_percent']:.2f}%)
+  PnL:        {pnl_sign}${trade['pnl']:.2f} (ROE {trade['pnl_percent']:+.2f}% | Price {price_pct:+.2f}%)
   Razón:      {trade['exit_reason']}
   Timeframe:  {trade.get('timeframe', 'N/A')}
+  Bot:        {bot_name}
   Fecha:      {trade['exit_time']}
 """
         

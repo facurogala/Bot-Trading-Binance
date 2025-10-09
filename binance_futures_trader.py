@@ -14,6 +14,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# ========================= Helpers =========================
+def _round_to_step(value: float, step: float) -> float:
+    """Redondea hacia abajo al múltiplo de step."""
+    import math
+    if step <= 0:
+        return value
+    steps = math.floor(value / step)
+    prec = len(str(step).split('.')[-1].rstrip('0'))
+    return round(steps * step, prec)
+
+
+def _round_to_tick(price: float, tick: float) -> float:
+    """Redondea hacia abajo al múltiplo de tickSize."""
+    import math
+    if tick <= 0:
+        return price
+    steps = math.floor(price / tick)
+    prec = len(str(tick).split('.')[-1].rstrip('0'))
+    return round(steps * tick, prec)
+
+
 class BinanceFuturesTrader:
     def __init__(self):
         api_key = os.getenv("BINANCE_API_KEY")
@@ -135,17 +156,7 @@ class BinanceFuturesTrader:
 
     def round_step_size(self, quantity: float, step_size: float) -> float:
         """Redondea la cantidad hacia abajo según el step_size del símbolo."""
-        try:
-            import math
-            if step_size <= 0:
-                return quantity
-            steps = math.floor(quantity / step_size)
-            q = steps * step_size
-            precision = len(str(step_size).split('.')[-1].rstrip('0'))
-            return round(q, precision)
-        except Exception:
-            precision = len(str(step_size).split('.')[-1].rstrip('0'))
-            return round(quantity - (quantity % step_size), precision)
+        return _round_to_step(quantity, step_size)
 
     # ---------------- Sizing por riesgo ----------------
 
@@ -178,7 +189,7 @@ class BinanceFuturesTrader:
             # Ajustes por filtros del símbolo
             f = self._get_symbol_filters(symbol)
 
-            # Si notional < minNotional, subir qty a ese mínimo (o devolver 0 si no querés subir riesgo)
+            # Si notional < minNotional, subir qty a ese mínimo
             if notional < f["minNotional"]:
                 qty_raw = f["minNotional"] / entry_price
 
@@ -187,7 +198,7 @@ class BinanceFuturesTrader:
             if qty < f["minQty"]:
                 qty = f["minQty"]
 
-            # Revalidar notional tras redondeo; si aún queda por debajo del mínimo, subir un paso
+            # Revalidar notional tras redondeo; si queda por debajo, subir un paso
             if qty * entry_price < f["minNotional"]:
                 import math
                 steps_needed = math.ceil((f["minNotional"] / entry_price) / f["stepSize"])
@@ -223,6 +234,11 @@ class BinanceFuturesTrader:
     ) -> Optional[Dict]:
         """
         Abre una posición en Binance Futures con SL y múltiples TPs.
+        Parcheado con:
+          - Validaciones LONG/SHORT vs mark
+          - Redondeo por tickSize para SL/TP
+          - workingType="MARK_PRICE", priceProtect=True
+          - Compatibilidad hedge mode con positionSide
         """
         try:
             # Configurar apalancamiento
@@ -234,35 +250,58 @@ class BinanceFuturesTrader:
                 print(f"❌ Cantidad calculada inválida: {quantity}")
                 return None
 
-            # Redondear cantidad según LOT_SIZE (por si acaso)
+            # Info del símbolo y filtros
             symbol_info = self.get_symbol_info(symbol)
-            if symbol_info:
-                for f in symbol_info['filters']:
-                    if f['filterType'] == 'LOT_SIZE':
-                        step_size = float(f['stepSize'])
-                        quantity = self.round_step_size(quantity, step_size)
-                        break
+            f = self._get_symbol_filters(symbol)
+            step_size = f["stepSize"]
+            tick_size = f["tickSize"]
 
             # Dirección de la orden
-            order_side = "BUY" if side == "LONG" else "SELL"
+            is_long = (side == "LONG")
+            order_side = "BUY" if is_long else "SELL"
 
             print(f"\n{'='*60}")
             print(f"📊 ABRIENDO POSICIÓN {side}")
             print(f"{'='*60}")
             print(f"Symbol: {symbol}")
             print(f"Side: {order_side}")
-            print(f"Quantity: {quantity}")
+            print(f"Quantity (pre-redondeo): {quantity}")
             print(f"Entry: {entry_price}")
             print(f"SL: {sl_price}")
             print(f"TPs: {tp_prices}")
             print(f"Leverage: {self.leverage}x")
             print(f"{'='*60}\n")
 
-            # Obtener precisión de precio para redondear correctamente
-            price_precision = symbol_info.get('pricePrecision', 2) if symbol_info else 2
-            entry_price_rounded = round(entry_price, price_precision)
+            # Redondear cantidad a LOT_SIZE
+            quantity = self.round_step_size(quantity, step_size)
 
-            # Orden de entrada
+            # Obtener MARK_PRICE para validaciones de disparo
+            mark = float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
+
+            # Redondeos de precios por tick
+            entry_price_rounded = _round_to_tick(entry_price, tick_size)
+            sl_price_rounded = _round_to_tick(sl_price, tick_size)
+            tp_prices_rounded = [_round_to_tick(p, tick_size) for p in tp_prices]
+
+            # Validaciones de disparo correctas
+            if is_long and not (sl_price_rounded < mark):
+                raise ValueError(f"SL inválido LONG: stopPrice {sl_price_rounded} debe ser < mark {mark}")
+            if (not is_long) and not (sl_price_rounded > mark):
+                raise ValueError(f"SL inválido SHORT: stopPrice {sl_price_rounded} debe ser > mark {mark}")
+            for i, p in enumerate(tp_prices_rounded):
+                if is_long and not (p > mark):
+                    raise ValueError(f"TP{i+1} inválido LONG: stopPrice {p} debe ser > mark {mark}")
+                if (not is_long) and not (p < mark):
+                    raise ValueError(f"TP{i+1} inválido SHORT: stopPrice {p} debe ser < mark {mark}")
+
+            # Detectar hedge mode
+            try:
+                hedge = self.client.futures_position_mode()['dualSidePosition']  # True = hedge
+            except Exception:
+                hedge = False
+            position_side = "LONG" if is_long else "SHORT"
+
+            # ===== Orden de entrada =====
             if force_market:
                 entry_order = self.client.futures_create_order(
                     symbol=symbol,
@@ -313,6 +352,91 @@ class BinanceFuturesTrader:
                     print(f"⚠️ Error al esperar fill de la orden de entrada: {e}")
                     return None
 
+            # Asegurar entry real válido (> 0). En órdenes MARKET, avgPrice puede venir 0.
+            try:
+                # Intentar varias veces leer entryPrice de la posición si avgPrice es 0
+                attempts = 0
+                while ((not actual_entry) or (actual_entry <= 0)) and attempts < 10:
+                    pos_info = self.client.futures_position_information(symbol=symbol)
+                    for _p in pos_info:
+                        if _p.get('symbol') == symbol:
+                            amt = float(_p.get('positionAmt', 0))
+                            ep = float(_p.get('entryPrice', 0))
+                            if abs(amt) > 0 and ep > 0:
+                                actual_entry = ep
+                                break
+                    if (not actual_entry) or (actual_entry <= 0):
+                        time.sleep(0.2)
+                        attempts += 1
+                if (not actual_entry) or (actual_entry <= 0):
+                    # Fallback conservador: usar el precio de orden redondeado o mark
+                    actual_entry = entry_price_rounded if entry_price_rounded > 0 else mark
+            except Exception:
+                if (not actual_entry) or (actual_entry <= 0):
+                    actual_entry = entry_price_rounded if entry_price_rounded > 0 else mark
+
+            # ——— Ajuste extra: asegurar que los TP estén del lado correcto respecto al precio de entrada real ———
+            try:
+                # Refrescar mark para validar después del ajuste
+                mark_after = float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
+            except Exception:
+                mark_after = mark
+
+            # Asegurar TPs correctos según el lado de la operación
+            def _fallback_tps(entry: float, sl: float, is_long_pos: bool) -> List[float]:
+                # Genera 3 TPs basados en la distancia al SL (0.6, 0.8, 1.0 R)
+                dist = abs(entry - sl)
+                if dist <= tick_size:
+                    dist = tick_size * 3
+                scales = [1.0, 0.8, 0.6]
+                if is_long_pos:
+                    return [_round_to_tick(entry + dist * s, tick_size) for s in scales]
+                else:
+                    return [_round_to_tick(entry - dist * s, tick_size) for s in scales]
+
+            # Filtrar TPs por lado rentable relativo a la entrada real
+            orig_tp = list(tp_prices_rounded)
+            if is_long:
+                tp_prices_rounded = [p for p in tp_prices_rounded if p > actual_entry]
+                # Orden ascendente para LONG (del más cercano al más lejano)
+                tp_prices_rounded.sort()
+            else:
+                tp_prices_rounded = [p for p in tp_prices_rounded if p < actual_entry]
+                # Orden descendente para SHORT (del más cercano al más lejano)
+                tp_prices_rounded.sort(reverse=True)
+
+            if len(tp_prices_rounded) == 0:
+                print("⚠️ Ningún TP original estaba del lado correcto vs entry; generando TPs de respaldo basados en SL…")
+                tp_prices_rounded = _fallback_tps(actual_entry, sl_price_rounded, is_long)
+
+            # Revalidar relación con mark price (LONG: TP > mark; SHORT: TP < mark)
+            tps_ok = []
+            for p in tp_prices_rounded:
+                # Evitar precios no positivos
+                if p <= 0:
+                    p = tick_size
+                if is_long and p <= mark_after:
+                    # Empujar al menos 1 tick por encima del mark
+                    p = _round_to_tick(mark_after + tick_size, tick_size)
+                if (not is_long) and p >= mark_after:
+                    # Empujar al menos 1 tick por debajo del mark
+                    p = _round_to_tick(mark_after - tick_size, tick_size)
+                tps_ok.append(p)
+
+            # Eliminar duplicados manteniendo el orden
+            seen = set()
+            tp_prices_rounded = []
+            for p in tps_ok:
+                if p not in seen:
+                    tp_prices_rounded.append(p)
+                    seen.add(p)
+
+            # Log si hubo ajuste
+            if tp_prices_rounded != orig_tp:
+                print("ℹ️ TPs ajustados respecto a la entrada real para asegurar dirección correcta:")
+                print(f"   Antes: {orig_tp}")
+                print(f"   Después: {tp_prices_rounded}")
+
             # Cantidad real (por si hubo fill parcial)
             actual_position_qty = quantity
             try:
@@ -324,86 +448,146 @@ class BinanceFuturesTrader:
             except Exception:
                 actual_position_qty = quantity
 
-            quantity = actual_position_qty
+            quantity = self.round_step_size(actual_position_qty, step_size)
 
-            print(f"\n🔄 Usando reconciliación de órdenes para garantizar SL/TP en Binance...")
+            # ========== CREACIÓN DE ÓRDENES SL Y TP ==========
+            print(f"\n{'='*60}")
+            print(f"🎯 CONFIGURANDO STOP LOSS Y TAKE PROFITS")
+            print(f"{'='*60}")
+
             sl_order = None
             tp_orders = []
 
-            if self.reconciler:
+            # ===== STOP LOSS =====
+            sl_side = "SELL" if is_long else "BUY"
+            sl_kwargs = dict(
+                symbol=symbol,
+                side=sl_side,
+                type="STOP_MARKET",
+                stopPrice=sl_price_rounded,
+                workingType="MARK_PRICE",
+                priceProtect=True
+            )
+            if hedge:
+                sl_kwargs["positionSide"] = position_side
+                sl_kwargs["closePosition"] = True
+            else:
+                sl_kwargs["closePosition"] = True
+
+            max_sl_retries = 3
+            for attempt in range(max_sl_retries):
                 try:
-                    sl_order, tp_orders = self.reconciler.ensure_orders_exist(
-                        symbol=symbol,
-                        side=side,
-                        quantity=quantity,
-                        sl_price=sl_price,
-                        tp_prices=tp_prices,
-                        max_retries=3
-                    )
-                    if sl_order and len(tp_orders) > 0:
-                        print(f"✅ Reconciliación exitosa: 1 SL + {len(tp_orders)} TP(s)")
-                    else:
-                        print(f"⚠️ Reconciliación parcial: SL={bool(sl_order)}, TPs={len(tp_orders)}")
+                    sl_order = self.client.futures_create_order(**sl_kwargs)
+                    print(f"✅ Stop Loss creado (id={sl_order.get('orderId')}, price={sl_price_rounded})")
+                    break
                 except Exception as e:
-                    print(f"⚠️ Error en reconciliación: {e}")
-                    print("   Intentando método tradicional...")
+                    print(f"❌ SL intento {attempt + 1}/{max_sl_retries} falló: {e}")
+                    if attempt < max_sl_retries - 1:
+                        time.sleep(1)
 
-            # Fallback tradicional
-            if not self.reconciler or not sl_order:
-                print("⚠️ Usando creación tradicional de órdenes (sin reconciler)")
-                sl_side = "SELL" if side == "LONG" else "BUY"
-                if symbol_info:
-                    price_precision = symbol_info['pricePrecision']
-                    sl_price = round(sl_price, price_precision)
+            # ===== TAKE PROFITS =====
+            if len(tp_prices_rounded) > 0 and quantity > 0:
+                tp_target_count = len(tp_prices_rounded)
+                print(f"\n🎯 Creando {tp_target_count} Take Profit(s)...")
 
-                try:
-                    sl_order = self.client.futures_create_order(
-                        symbol=symbol,
-                        side=sl_side,
-                        type="STOP_MARKET",
-                        stopPrice=sl_price,
-                        closePosition=True
+                # qty por TP
+                base_tp_qty = self.round_step_size(quantity / tp_target_count, step_size)
+                tp_side = "SELL" if is_long else "BUY"
+                final_tp_prices: List[float] = []
+
+                for i, tp in enumerate(tp_prices_rounded, 1):
+                    # Garantizar condición estricta respecto a la entrada real
+                    if is_long and tp <= actual_entry:
+                        tp = _round_to_tick(actual_entry + tick_size, tick_size)
+                    elif (not is_long) and tp >= actual_entry:
+                        tp = _round_to_tick(actual_entry - tick_size, tick_size)
+
+                    # Revalidación adicional vs mark actual por seguridad
+                    try:
+                        current_mark = float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
+                    except Exception:
+                        current_mark = mark
+                    if is_long and tp <= current_mark:
+                        tp = _round_to_tick(max(current_mark, actual_entry) + tick_size, tick_size)
+                    if (not is_long) and tp >= current_mark:
+                        tp = _round_to_tick(min(current_mark, actual_entry) - tick_size, tick_size)
+
+                    use_qty = base_tp_qty if i < len(tp_prices_rounded) else self.round_step_size(
+                        quantity - base_tp_qty * (len(tp_prices_rounded) - 1), step_size
                     )
-                    print(f"✅ Stop Loss configurado: {sl_order.get('orderId')}")
-                except Exception as e:
-                    print(f"⚠️ Error al configurar Stop Loss: {e}")
-                    sl_order = None
+                    if use_qty <= 0:
+                        continue
 
-                if len(tp_prices) > 0 and len(tp_orders) == 0:
-                    tp_quantity = quantity / len(tp_prices) if quantity > 0 else 0
-                    if symbol_info:
-                        for f in symbol_info['filters']:
-                            if f['filterType'] == 'LOT_SIZE':
-                                step_size = float(f['stepSize'])
-                                tp_quantity = self.round_step_size(tp_quantity, step_size)
-                                break
+                    tp_kwargs = dict(
+                        symbol=symbol,
+                        side=tp_side,
+                        type="TAKE_PROFIT_MARKET",
+                        stopPrice=tp,
+                        quantity=use_qty,
+                        reduceOnly=True,
+                        workingType="MARK_PRICE",
+                        priceProtect=True
+                    )
+                    if hedge:
+                        tp_kwargs["positionSide"] = position_side
 
-                    tp_side = "SELL" if side == "LONG" else "BUY"
-                    price_precision = symbol_info.get('pricePrecision', 2) if symbol_info else 2
-
-                    for i, tp_price in enumerate(tp_prices, 1):
+                    max_tp_retries = 3
+                    for attempt in range(max_tp_retries):
                         try:
-                            if i == len(tp_prices):
-                                remaining_qty = quantity - (tp_quantity * (len(tp_prices) - 1))
-                                use_qty = remaining_qty
-                            else:
-                                use_qty = tp_quantity
-
-                            tp_price_rounded = round(tp_price, price_precision)
-
-                            tp_order = self.client.futures_create_order(
-                                symbol=symbol,
-                                side=tp_side,
-                                type="TAKE_PROFIT_MARKET",
-                                stopPrice=tp_price_rounded,
-                                quantity=use_qty,
-                                reduceOnly=True
-                            )
+                            tp_order = self.client.futures_create_order(**tp_kwargs)
                             tp_orders.append(tp_order)
-                            print(f"✅ TP{i} configurado en {tp_price_rounded}: {tp_order.get('orderId')}")
-                            time.sleep(0.2)
+                            actual_tp_price = float(tp_order.get('stopPrice') or tp_order.get('price') or tp)
+                            final_tp_prices.append(actual_tp_price)
+                            print(f"   ✅ TP{i} creado (id={tp_order.get('orderId')}, price={actual_tp_price}, qty={use_qty})")
+                            break
                         except Exception as e:
-                            print(f"⚠️ Error al configurar TP{i}: {e}")
+                            print(f"   ❌ TP{i} intento {attempt + 1}/{max_tp_retries} falló: {e}")
+                            if attempt < max_tp_retries - 1:
+                                time.sleep(1)
+                    time.sleep(0.25)
+
+                if final_tp_prices:
+                    tp_prices_rounded = final_tp_prices
+                else:
+                    tp_prices_rounded = []
+
+            # ===== RESUMEN =====
+            print(f"\n{'='*60}")
+            print(f"📋 RESUMEN DE ÓRDENES")
+            print(f"{'='*60}")
+            print(f"Stop Loss: {'CREADO' if sl_order else 'NO CREADO'}")
+            print(f"Take Profits creados: {len(tp_orders)}/{len(tp_prices_rounded)}")
+
+            if not sl_order:
+                print("\n⚠️ ATENCIÓN: NO se pudo crear el Stop Loss. La posición está desprotegida.\n")
+
+            # ===== VERIFICACIÓN EN BINANCE =====
+            print("\n🔍 Verificando órdenes en Binance...")
+            time.sleep(1)
+            try:
+                open_orders = self.client.futures_get_open_orders(symbol=symbol)
+                sl_found = False
+                tp_count = 0
+                print("\n📋 Órdenes activas encontradas:")
+                for order in open_orders:
+                    otype = order.get('type', '')
+                    oid = order.get('orderId', '')
+                    sprice = order.get('stopPrice', '')
+                    qty = order.get('origQty', '')
+                    if 'STOP' in otype and 'TAKE_PROFIT' not in otype:
+                        sl_found = True
+                        print(f"   🛑 SL: id={oid} | price={sprice}")
+                    elif 'TAKE_PROFIT' in otype:
+                        tp_count += 1
+                        print(f"   🎯 TP: id={oid} | price={sprice} | qty={qty}")
+                if not sl_found:
+                    print("❌ No se encontró SL activo.")
+                if tp_count == len(tp_prices_rounded):
+                    print(f"✅ Verificados {tp_count}/{len(tp_prices_rounded)} TP")
+                else:
+                    print(f"⚠️ Verificados {tp_count}/{len(tp_prices_rounded)} TP")
+            except Exception as e:
+                print(f"⚠️ Error al verificar órdenes: {e}")
 
             result = {
                 'symbol': symbol,
@@ -413,12 +597,14 @@ class BinanceFuturesTrader:
                 'tp_orders': tp_orders,
                 'quantity': quantity,
                 'entry_price': actual_entry,
-                'sl_price': sl_price,
-                'tp_prices': tp_prices,
+                'sl_price': sl_price_rounded,
+                'tp_prices': tp_prices_rounded,
                 'leverage': self.leverage
             }
 
-            print(f"\n✅ Posición {side} abierta exitosamente en {symbol}")
+            print(f"\n{'='*60}")
+            print(f"✅ Posición {side} abierta exitosamente en {symbol}")
+            print(f"{'='*60}\n")
 
             # Monitoreo opcional
             enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
@@ -525,7 +711,7 @@ class BinanceFuturesTrader:
             return False
 
 
-# Función de prueba
+# ========================= Prueba rápida =========================
 if __name__ == "__main__":
     print("🧪 Probando conexión con Binance Futures...\n")
     try:

@@ -43,6 +43,15 @@ def main():
     # Crear dashboard
     dashboard = TradingDashboard(args.db)
     db = TradingDatabase(args.db)
+
+    # Recalcular PnL de trades cerrados para asegurar consistencia antes de generar reportes
+    try:
+        updated = db.recalc_closed_trades_pnl()
+        if updated:
+            print(f"🛠️ Recalculados {updated} trades cerrados (pnl y % corregidos)")
+    except Exception as _e:
+        # Continuar aunque falle la recalculación (no bloquear el reporte)
+        print("⚠️ No se pudo ejecutar la recalculación de PnL. Continuando...")
     
     # Gestión de sesión por bot
     if args.bot and args.start_session:
@@ -93,6 +102,8 @@ def main():
     print("📊 Generando reporte completo...")
     try:
         filepath = dashboard.generate_full_report(args.output, bot=args.bot)
+        # Generar también reporte consolidado de nombre fijo
+        dashboard.generate_consolidated_report(args.output, filename_base="trading_report_all", bot=args.bot)
         print(f"\n✅ ¡Reporte generado exitosamente!")
         print(f"📁 Archivos guardados en: {args.output}/")
         

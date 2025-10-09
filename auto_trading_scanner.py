@@ -13,6 +13,7 @@ import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
+from trade_monitor import TradeMonitor
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -302,6 +303,15 @@ if AUTO_TRADE_ENABLED:
 db = TradingDatabase("trading_history.db")
 print("✅ Base de datos de trading inicializada")
 
+# Inicializar Trade Monitor
+trade_monitor = None
+if AUTO_TRADE_ENABLED and trader:
+    try:
+        trade_monitor = TradeMonitor(trader, db, bot_name="Scanner")
+        trade_monitor.start()
+    except Exception as e:
+        print(f"⚠️ No se pudo inicializar TradeMonitor: {e}")
+
 # Diccionario para rastrear trades abiertos
 open_trades_registry = {}  # {symbol: trade_id}
 
@@ -510,15 +520,20 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             )
             
             # Registrar órdenes individuales
+            entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
+            try:
+                entry_price_record = float(entry_price_record)
+            except Exception:
+                entry_price_record = result['entry_price']
             db.add_order(
                 trade_id=trade_id,
                 order_id=str(result['entry_order']['orderId']),
                 order_type="ENTRY",
                 side=result['entry_order']['side'],
                 symbol=symbol,
-                price=result['entry_price'],
+                price=entry_price_record,
                 quantity=result['quantity'],
-                status="FILLED"
+                status=result['entry_order'].get('status', 'FILLED')
             )
             
             if result.get('sl_order'):
@@ -541,11 +556,19 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     side=tp_order['side'],
                     symbol=symbol,
                     price=result['tp_prices'][i-1],
+                    quantity=result['quantity'],
                     status="NEW"
                 )
             
             # Guardar referencia al trade
             open_trades_registry[symbol] = trade_id
+            
+            # Registrar en el Trade Monitor
+            if trade_monitor:
+                try:
+                    trade_monitor.register_trade(symbol, trade_id)
+                except Exception as e:
+                    print(f"⚠️ Error registrando en TradeMonitor: {e}")
             
             # Iniciar monitoreo con el trade_id correcto si el reconciler está disponado
             if hasattr(trader, 'reconciler') and trader.reconciler:

@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
+from auto_closer import AutoCloser
 from trading_dashboard import generate_quick_report, TradingDashboard
 
 
@@ -83,7 +84,7 @@ TP_ATR_MULT = 2.4         # fallback si TP_MULTS = None
 
 # Tendencia/EMAs
 REQUIRE_EMA200_TREND = True
-MIN_EMA_DISTANCE = 0.003      # 0.30%
+MIN_EMA_DISTANCE = 0.0018     # más laxo: antes 0.30%
 MIN_TREND_SLOPE = 0.0008      # pendiente relativa de EMA20 (en 10 velas)
 
 # Volumen
@@ -96,7 +97,7 @@ RSI_SHORT_MIN, RSI_SHORT_MAX = 30, 60
 # Stop/TP / Volatilidad
 MAX_SL_PERCENT = 0.080        # 3.5%
 MIN_ATR_PCT = 0.0015           # 0.4%
-MAX_ATR_PCT = 0.080           # 3.0%
+MAX_ATR_PCT = 0.090           # más laxo: antes 0.080
 
 # Fibonacci y Confluencias
 USE_FIB = True
@@ -117,7 +118,7 @@ REQUIRE_CLOSE_IN_DIRECTION = True
 STRUCT_REQUIRE_HH_HL = True
 STRUCT_SWING_DEPTH = 3
 ADX_FILTER = True
-ADX_MIN = 18
+ADX_MIN = 14                  # más laxo: antes 18
 MIN_BODY_TO_RANGE = 0.5
 MAX_UPWICK_FOR_LONG = 0.4
 MAX_DOWNWICK_FOR_SHORT = 0.4
@@ -152,7 +153,7 @@ USE_HYBRID = True
 GATE_BLOCK_IN_KUMO = True
 GATE_REQUIRE_EMA200_TREND = True
 GATE_REQUIRE_ICHI_TREND = True
-GATE_CHIKOU_CONFIRM = True
+GATE_CHIKOU_CONFIRM = False   # más laxo: desactivado temporalmente
 GATE_MIN_EMA_DIST = MIN_EMA_DISTANCE             # 0.30%
 GATE_ATR_RANGE = (MIN_ATR_PCT, MAX_ATR_PCT)
 
@@ -173,7 +174,7 @@ SCORE_W = {
     "multi_tf_alignment": 1.0,
     "impulse": 2.0,              # bonus por vela de impulso (H1/H4)
 }
-MIN_SCORE_TO_TRADE = 6.0  # ajustá según selectividad deseada
+MIN_SCORE_TO_TRADE = 5.2  # más laxo: antes 6.0
 
 # Gestión / Frecuencia
 MAX_CONCURRENT_POS = 3
@@ -986,6 +987,10 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             notes="Haack",
             bot="Haack",
         )
+        try:
+            db.increment_bot_activity(bot="Haack", executed_delta=1)
+        except Exception:
+            pass
 
         _last_trade_time[key] = now
         _daily_trade_count[day] = cnt + 1
@@ -1068,12 +1073,12 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
     """Escanea toda la watchlist en todos los timeframes una vez, con resumen por símbolo."""
     # Encabezado estilo conservador
     print("\n" + "="*60)
-    print("🛡️ ESCANEO HAACK")
+    print("🧭 ESCANEO HAACK")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
     print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS")
+    print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
     print("="*60)
-    print("🛡️ Filtros activos:")
+    print("🛡️ Filtros activos (Haack):")
     print(f"   ✅ Tendencia EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'}")
     print(f"   ✅ Distancia EMAs mínima: {MIN_EMA_DISTANCE*100:.2f}% | Slope min: {MIN_TREND_SLOPE*100:.2f}%")
     print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x")
@@ -1096,7 +1101,26 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
             for timeframe in TIMEFRAMES:
                 signal = analyze(symbol, timeframe)
                 if not signal:
-                    # Diagnóstico: verificar impulsos perdidos en BTCUSDT
+                    # Intentar obtener razones breves de rechazo (re-evaluar filtros mínimamente)
+                    try:
+                        dfd = cached_klines(symbol, timeframe, limit=220)
+                        if dfd is not None and not dfd.empty and len(dfd) >= 60:
+                            dfd["EMA20"] = ta.ema(dfd["close"], length=20)
+                            dfd["EMA50"] = ta.ema(dfd["close"], length=50)
+                            last = dfd.iloc[-1].copy()
+                            last["symbol"] = symbol
+                            last["timeframe"] = timeframe
+                            # Notar: no sabemos el side exacto si no hubo cruce; probamos ambos para mensaje
+                            for _side in ("LONG", "SHORT"):
+                                chk = check_filters(_side, dfd, last)
+                                if not chk.get("passed", False):
+                                    print(f"🛡️ {display_symbol(symbol)} [{timeframe}]: Señal {'BUY' if _side=='LONG' else 'SELL'} RECHAZADA")
+                                    for reason in chk.get('reasons', [])[:3]:
+                                        print(f"   {reason}")
+                                    break
+                    except Exception:
+                        pass
+                    # Diagnóstico adicional para impulsos en BTCUSDT
                     if symbol == "BTCUSDT" and timeframe in ("1h", "4h"):
                         try:
                             dfd = cached_klines(symbol, timeframe, limit=300)
@@ -1158,13 +1182,15 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
 
     # Reporte rápido + gráficos si hay info
     try:
-        print("\n📈 Estadísticas rápidas:")
+        print("\n" + "="*60)
+        print("� GENERANDO REPORTES AUTOMÁTICOS...")
+        print("="*60)
+        print(f"\n📈 ESTADÍSTICAS RÁPIDAS:")
         generate_quick_report("trading_history.db")
-        # Generar gráfico consolidado (pisa el anterior)
         dashboard = TradingDashboard("trading_history.db")
-        # Consolidado: un único archivo que se pisa en cada ciclo
         dashboard.generate_consolidated_report(output_dir="reports", filename_base="trading_report_all")
-        print("✅ Reportes actualizados en reports/")
+        print("✅ Gráfico consolidado actualizado: reports/trading_report_all.png")
+        print("="*60)
     except Exception as e:
         print(f"⚠️ No se pudieron generar reportes: {e}")
 
@@ -1237,6 +1263,7 @@ def main():
     # Inicializar componentes
     db = TradingDatabase("trading_history.db")
     trader: Optional[BinanceFuturesTrader] = None
+    auto_closer = None
     if AUTO_TRADE_ENABLED:
         try:
             trader = BinanceFuturesTrader()
@@ -1245,6 +1272,11 @@ def main():
             print(f"💰 Balance: {balance:.2f} USDT")
             print(f"📊 Leverage: {trader.leverage}x")
             print(f"⚠️ Riesgo por trade: {trader.risk_percent}%")
+            try:
+                auto_closer = AutoCloser(trader, db, bot_name="Haack")
+                auto_closer.start()
+            except Exception as e:
+                print(f"⚠️ AutoCloser no pudo iniciar: {e}")
         except Exception as e:
             print(f"⚠️ No se pudo iniciar trader (modo alerta): {e}")
             trader = None
@@ -1267,6 +1299,11 @@ def main():
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
             send_telegram("⚠️ Bot EMA+Ichimoku HAACK detenido")
+            try:
+                if auto_closer:
+                    auto_closer.stop()
+            except Exception:
+                pass
             break
         except Exception as e:
             print(f"\n❌ Error crítico: {e}")
