@@ -1,0 +1,29 @@
+
+╔═══════════════════════════════════════════════════════════════╗
+║              REPORTE DE TRADING (CONSOLIDADO)                 ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Generado: 2025-10-09 15:02:44
+
+ESTADÍSTICAS GENERALES - Bot: ScalpingLax
+============================================================
+Total de Trades:           0
+Trades Ganadores:          0 (0.0%)
+Trades Perdedores:         0 (100.0%)
+
+RENDIMIENTO
+============================================================
+PnL Total:                 $0.00
+Promedio Ganancia:         $0.00
+Promedio Pérdida:          $0.00
+Mejor Trade:               $0.00
+Peor Trade:                $0.00
+Profit Factor:             0.00
+
+
+ACTIVIDAD (PROMEDIO 7 DÍAS)
+============================================================
+Bot ScalpingLax: 0.00 operac./día
+
+ÚLTIMOS 10 TRADES
+============================================================

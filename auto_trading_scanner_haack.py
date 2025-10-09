@@ -28,6 +28,7 @@ from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from auto_closer import AutoCloser
 from trading_dashboard import generate_quick_report, TradingDashboard
+from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 
 # ================== CONFIG ==================
@@ -184,6 +185,19 @@ POSITION_SIZE_MULT = 1.0  # Nota: informativo (ajuste fino requiere cambios en t
 LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
+
+RISK_USD_PER_TRADE = env_float(
+    20.0,
+    "RISK_USD_HAACK",
+    "RISK_USD_GLOBAL",
+    "RISK_USD_DEFAULT",
+    "RISK_AMOUNT_USD",
+    context="Haack"
+)
+RISK_REWARD_TARGETS = parse_float_list(
+    os.getenv("HAACK_R_MULTIPLIERS", os.getenv("RISK_R_MULTIPLIERS_DEFAULT")),
+    default=(1.0, 1.6, 2.4)
+)
 
 # Intervalo entre escaneos
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
@@ -888,17 +902,17 @@ def build_levels(side: str, last_row: pd.Series, df: pd.DataFrame, symbol: str, 
     if sl_distance > MAX_SL_PERCENT:
         sl = price - SL_ATR_MULT * atr if side == "LONG" else price + SL_ATR_MULT * atr
 
-    # TPs
-    if TP_MULTS is None:
+    risk_distance = abs(price - sl)
+    tps = risk_tp_prices(price, sl, side, RISK_REWARD_TARGETS)
+    if not tps:
+        base_multipliers = TP_MULTS if TP_MULTS else [1.0, 0.8, 0.6]
         if side == "LONG":
-            tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+            tps = [price + TP_ATR_MULT * atr * m for m in base_multipliers]
         else:
-            tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
-    else:
-        if side == "LONG":
-            tps = [price + m * atr for m in TP_MULTS]
-        else:
-            tps = [price - m * atr for m in TP_MULTS]
+            tps = [price - TP_ATR_MULT * atr * m for m in base_multipliers]
+
+    while len(tps) < 3:
+        tps.append(tps[-1])
 
     # Info Fib/SR (diagnóstico)
     fib_info = fib_levels_from_swing(df, FIB_LOOKBACK_SWING, side) if USE_FIB else None
@@ -913,6 +927,8 @@ def build_levels(side: str, last_row: pd.Series, df: pd.DataFrame, symbol: str, 
         "tp3": round(tps[2], dec),
         "price": round(price, dec),
         "atr": atr,
+        "risk_distance": risk_distance,
+        "tp_prices": [round(tp, dec) for tp in tps[:3]],
         "timeframe": timeframe,
         "fib": fib_info,
         "sr": sr_info[-5:] if sr_info else [],
@@ -925,12 +941,15 @@ def format_trade_message(symbol: str, side: str, levels: Dict, timeframe: str, t
     action = "🚀 EJECUTADO" if traded else "👀 SEÑAL"
     imp = levels.get("impulse_flag", False)
     imp_txt = " ⚡IMPULSO" if imp else ""
+    tp_values = levels.get("tp_prices") or [levels.get("tp1"), levels.get("tp2"), levels.get("tp3")]
+    tp_values = [tp for tp in tp_values if tp is not None]
+    tp_text = " | ".join(str(tp) for tp in tp_values) if tp_values else "-"
     return (
         f"{action} {side} — {s} [{timeframe}]{imp_txt}\n"
         f"Precio: {levels['price']}\n"
         f"Entrada: {levels['entry_low']} - {levels['entry_high']}\n"
         f"SL: {levels['sl']}\n"
-        f"TPs: {levels['tp1']} | {levels['tp2']} | {levels['tp3']}"
+        f"TPs: {tp_text}"
     )
 
 
@@ -961,7 +980,10 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
 
         entry_price = levels["price"]
         sl_price = levels["sl"]
-        tp_prices = [levels["tp1"], levels["tp2"], levels["tp3"]]
+        tp_prices = levels.get("tp_prices") or [levels.get("tp1"), levels.get("tp2"), levels.get("tp3")]
+        tp_prices = [tp for tp in tp_prices if tp is not None]
+        if not tp_prices:
+            tp_prices = [entry_price]
 
         result = trader.open_position(
             symbol=symbol,
@@ -970,6 +992,7 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             sl_price=sl_price,
             tp_prices=tp_prices,
             force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE,
         )
 
         if not result:
@@ -982,10 +1005,17 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             quantity=result.get("quantity", 0),
             leverage=result.get("leverage", int(os.getenv("LEVERAGE", "5"))),
             sl_price=sl_price,
-            tp_prices=tp_prices,
+            tp_prices=result.get("tp_prices", tp_prices),
             timeframe=timeframe,
             notes="Haack",
             bot="Haack",
+            entry_order_id=result.get("entry_order_id"),
+            entry_client_order_id=result.get("entry_client_order_id"),
+            position_id=result.get("position_id"),
+            margin_balance_entry=result.get("margin_before"),
+            margin_balance_post_entry=result.get("margin_after"),
+            margin_used=result.get("margin_used"),
+            isolated_margin=result.get("isolated_margin"),
         )
         try:
             db.increment_bot_activity(bot="Haack", executed_delta=1)
@@ -1147,8 +1177,11 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
                 fibtxt = "FIB" if lv.get("fib") else "-"
                 srtxt = f"SRx{len(lv.get('sr', []))}" if lv.get("sr") else "-"
                 imp_txt = " ⚡" if lv.get("impulse_flag") else ""
+                tp_values = lv.get("tp_prices") or [lv.get("tp1"), lv.get("tp2"), lv.get("tp3")]
+                tp_values = [tp for tp in tp_values if tp is not None]
+                tp_text = " / ".join(str(tp) for tp in tp_values) if tp_values else "-"
                 per_symbol_details.append(
-                    f"[{timeframe}] {signal['side']}{imp_txt} | Precio: {lv['price']} | SL: {lv['sl']} (-{sl_pct:.2f}%) | ATR: {atr_val:.4f} | TP: {lv['tp1']} / {lv['tp2']} / {lv['tp3']} | Score: {sc if sc is not None else '-'} | {fibtxt}/{srtxt}"
+                    f"[{timeframe}] {signal['side']}{imp_txt} | Precio: {lv['price']} | SL: {lv['sl']} (-{sl_pct:.2f}%) | ATR: {atr_val:.4f} | TP: {tp_text} | Score: {sc if sc is not None else '-'} | {fibtxt}/{srtxt}"
                 )
 
                 msg = format_trade_message(symbol, signal["side"], signal["levels"], timeframe, traded=False)

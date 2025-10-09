@@ -24,6 +24,7 @@ from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
 from auto_closer import AutoCloser
+from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -161,6 +162,19 @@ LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
+RISK_USD_PER_TRADE = env_float(
+    10.0,
+    "RISK_USD_SCALPING_LAX",
+    "RISK_USD_GLOBAL",
+    "RISK_USD_DEFAULT",
+    "RISK_AMOUNT_USD",
+    context="ScalpingLax"
+)
+RISK_REWARD_TARGETS = parse_float_list(
+    os.getenv("SCALPING_LAX_R_MULTIPLIERS", os.getenv("RISK_R_MULTIPLIERS_DEFAULT")),
+    default=(1.0, 1.5, 2.0)
+)
+
 # Escaneo cada 3 minutos (ideal para 5m)
 SCAN_INTERVAL_SECONDS = 180
 
@@ -181,7 +195,7 @@ if AUTO_TRADE_ENABLED:
         trader = BinanceFuturesTrader()
         print("✅ Trader de Binance Futures inicializado")
         try:
-            auto_closer = AutoCloser(trader, db, bot_name="ScalpingLax")
+            auto_closer = AutoCloser(trader, db, bot_name=BOT_NAME)
             auto_closer.start()
         except Exception as e:
             print(f"⚠️ AutoCloser no pudo iniciar: {e}")
@@ -231,7 +245,11 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str, t
     sy = display_symbol(symbol)
     tf_name = TIMEFRAME_NAMES.get(timeframe, timeframe)
     dec = levels['decimals']; fmt = f"{{:.{dec}f}}"
-    status = f"{MESSAGE_PREFIX} 🤖 <b>TRADE EJECUTADO</b>" if traded else f"{MESSAGE_PREFIX} 🚨 <b>SEÑAL DETECTADA</b>"
+    status = (
+        f"{MESSAGE_PREFIX} 🤖 <b>{BOT_NAME} — TRADE EJECUTADO</b>"
+        if traded
+        else f"{MESSAGE_PREFIX} 🚨 <b>{BOT_NAME} — SEÑAL DETECTADA</b>"
+    )
     entry_str = f"{fmt.format(levels['entry_high'])} - {fmt.format(levels['entry_low'])}"
     tp_lines = "\n".join([f"🟢 TP{i+1}: {fmt.format(p)}" if side == "LONG"
                           else f"🔻 TP{i+1}: {fmt.format(p)}"
@@ -354,10 +372,11 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
 
     if side == "LONG":
         sl = recent_lows - SL_ATR_MULT * atr
-        tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
     else:
         sl = recent_highs + SL_ATR_MULT * atr
-        tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+
+    risk_distance = abs(price - sl)
+    tps = risk_tp_prices(price, sl, side, RISK_REWARD_TARGETS)
 
     return {
         'entry_price': price,
@@ -368,7 +387,8 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
         'vol_ratio': vol_ratio,
         'price': price,
         'decimals': dec,
-        'atr': atr
+        'atr': atr,
+        'risk_distance': risk_distance
     }
 
 # ================== CHECK FILTERS (GATES + SCORE) ==================
@@ -522,7 +542,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
-            force_market=USE_MARKET_ORDER
+            force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE
         )
         if result:
             trade_id = db.add_trade(
@@ -601,12 +622,12 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
 # ================== LOOP DE ESCANEO ==================
 def run_scan_once():
     print("\n" + "="*60)
-    print("⚡ ESCANEO SCALPING_LAX")
+    print(f"⚡ ESCANEO {BOT_NAME.upper()}")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
     print(datetime.utcnow().strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
     print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
     print("="*60)
-    print("🛡️ Filtros activos (ScalpingLax):")
+    print(f"🛡️ Filtros activos ({BOT_NAME}):")
     print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Dist EMAs ≥ {MIN_EMA_DISTANCE*100:.2f}% | Slope ≥ {MIN_TREND_SLOPE*100:.2f}%")
     print(f"   ✅ Vol: 5m/15m ≥ {MIN_VOLUME_RATIO_5_15:.2f}x | 30m/1h ≥ {MIN_VOLUME_RATIO_30_60:.2f}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ SL máx: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}–{MAX_ATR_PCT*100:.2f}%] | ADX≥{ADX_MIN}")
@@ -682,7 +703,7 @@ def run_scan_once():
 
                 send_telegram(format_trade_message(symbol, side, levels, timeframe, traded=False))
                 try:
-                    db.increment_bot_activity(bot="ScalpingLax", approved_delta=1)
+                    db.increment_bot_activity(bot=BOT_NAME, approved_delta=1)
                 except Exception:
                     pass
 
@@ -693,7 +714,7 @@ def run_scan_once():
                         _daily_trade_count[day] = day_stats
                         summary["executed"] += 1
                         try:
-                            db.increment_bot_activity(bot="ScalpingLax", executed_delta=1)
+                            db.increment_bot_activity(bot=BOT_NAME, executed_delta=1)
                         except Exception:
                             pass
                         send_telegram(format_trade_message(symbol, side, levels, timeframe, traded=True))
@@ -711,7 +732,7 @@ def run_scan_once():
 
     _daily_trade_count[day] = day_stats
 
-    print("\n📊 Resumen [LAX]:")
+    print(f"\n📊 Resumen [{BOT_NAME.upper()}]:")
     print(f"   Señales detectadas: {summary['detected']}")
     print(f"   Señales aprobadas: {summary['approved']}")
     print(f"   Señales rechazadas: {summary['rejected']}")
@@ -727,7 +748,7 @@ def run_scan_once():
         print("📈 GENERANDO REPORTES AUTOMÁTICOS...")
         print("="*60)
         print("\n📊 ESTADÍSTICAS RÁPIDAS:")
-        generate_quick_report(DB_PATH, bot="ScalpingLax")
+        generate_quick_report(DB_PATH, bot=BOT_NAME)
         dashboard = TradingDashboard(DB_PATH)
         dashboard.generate_consolidated_report(output_dir="reports", filename_base=REPORT_BASENAME, bot=BOT_NAME)
         print(f"✅ Gráfico consolidado actualizado: reports/{REPORT_BASENAME}.png")
@@ -744,7 +765,7 @@ def log_weekly_kpis():
         print(f"⚠️ No se pudieron calcular KPIs semanales: {exc}")
         return
 
-    print("\n📈 KPIs semanales [LAX]:")
+    print(f"\n📈 KPIs semanales [{BOT_NAME.upper()}]:")
     total_trades = kpis.get("total_trades", 0)
     if total_trades == 0:
         print("   Sin trades en la última semana.")
@@ -767,7 +788,7 @@ def log_weekly_kpis():
 
 # ================== MAIN ==================
 def main():
-    print("🚀 Bot SCALPING_LAX + Auto Trading iniciado")
+    print(f"🚀 Bot {BOT_NAME.upper()} + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES)}")
     print(f"📊 Base de datos: {DB_PATH}")
@@ -787,7 +808,7 @@ def main():
         print("📢 MODO SOLO ALERTAS (trading desactivado)")
 
     minutes = max(1, int(SCAN_INTERVAL_SECONDS/60))
-    print(f"\n🛡️ FILTROS SCALPING_LAX ACTIVOS:")
+    print(f"\n🛡️ FILTROS {BOT_NAME.upper()} ACTIVOS:")
     print(f"   ✅ Vol 5m/15m ≥ {MIN_VOLUME_RATIO_5_15:.2f}x | 30m/1h ≥ {MIN_VOLUME_RATIO_30_60:.2f}x")
     print(f"   ✅ RSI LONG: {RSI_LONG_MIN}-{RSI_LONG_MAX} | RSI SHORT: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ Distancia EMAs: mín {MIN_EMA_DISTANCE*100:.2f}% | Slope mín {MIN_TREND_SLOPE*100:.2f}%")
@@ -795,7 +816,7 @@ def main():
     print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Score min {MIN_SCORE_TO_TRADE}")
     print(f"\n🔄 Escaneando cada {minutes} minutos...\n")
 
-    send_telegram(f"""⚡ <b>ScalpingLax iniciado</b>
+    send_telegram(f"""⚡ <b>{BOT_NAME} iniciado</b>
 📊 {len(WATCHLIST)} cryptos
 ⏰ TFs: {', '.join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES)}
 🔄 Escaneo cada {minutes} min
@@ -814,7 +835,7 @@ def main():
                     auto_closer.stop()
             except Exception:
                 pass
-            send_telegram("⚠️ ScalpingLax detenido")
+            send_telegram(f"⚠️ {BOT_NAME} detenido")
             break
         except Exception as e:
             print(f"❌ Error inesperado: {e}")

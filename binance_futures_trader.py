@@ -5,7 +5,7 @@ Incluye reconciliación automática de órdenes
 """
 import os
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -90,6 +90,14 @@ class BinanceFuturesTrader:
         self.leverage = int(os.getenv("LEVERAGE", "5"))                 # Apalancamiento por defecto
         self.risk_percent = float(os.getenv("RISK_PERCENT", "1.0"))     # % de capital por trade
         self.risk_on_available = os.getenv("RISK_ON_AVAILABLE", "True").lower() == "true"  # True = availableBalance
+        self.risk_amount_usd_default = float(
+            os.getenv(
+                "RISK_USD_DEFAULT",
+                os.getenv("RISK_USD_GLOBAL", os.getenv("RISK_AMOUNT_USD", "0"))
+            )
+            or 0.0
+        )
+        self._last_risk_budget: Optional[float] = None
 
         # Inicializar reconciler
         try:
@@ -171,21 +179,44 @@ class BinanceFuturesTrader:
 
     # ---------------- Sizing por riesgo ----------------
 
-    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
+    def calculate_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        sl_price: float,
+        risk_amount_usd: Optional[float] = None
+    ) -> Tuple[float, float]:
         """
-        Qty por riesgo %:
+        Qty por riesgo % o monto fijo:
           - Riesgo monetario al SL ≈ qty * |entry - sl| (futuros USDT lineales)
-          - NO dividir por leverage (no cambia el riesgo, sólo el margen requerido)
-          - Capear notional a balance * leverage
-          - Respetar LOT_SIZE y MIN_NOTIONAL
+          - Si ``risk_amount_usd`` > 0 se usa ese valor; de lo contrario, se
+            aplica el monto fijo por defecto o el porcentaje del balance.
+          - Capear notional a balance * leverage.
+          - Respetar LOT_SIZE y MIN_NOTIONAL.
+
+        Returns:
+            (cantidad_redondeada, presupuesto_riesgo_usd)
         """
         try:
             balance = self.get_account_balance()
-            risk_amount = balance * (self.risk_percent / 100.0)
+
+            if risk_amount_usd is not None and risk_amount_usd > 0:
+                risk_amount = risk_amount_usd
+            elif self.risk_amount_usd_default > 0:
+                risk_amount = self.risk_amount_usd_default
+            else:
+                risk_amount = balance * (self.risk_percent / 100.0)
+
+            if balance > 0:
+                risk_amount = min(risk_amount, balance)
+
+            if risk_amount <= 0:
+                risk_amount = max(balance * (self.risk_percent / 100.0), 0.0)
+
             delta = abs(entry_price - sl_price)
 
             if entry_price <= 0 or delta <= 0:
-                return 0.0
+                return 0.0, risk_amount
 
             # Tamaño teórico por riesgo (sin leverage)
             qty_raw = risk_amount / delta           # contratos (monedas)
@@ -193,7 +224,7 @@ class BinanceFuturesTrader:
 
             # Cap por leverage: evitar notional > balance * leverage
             max_notional = balance * self.leverage
-            if notional > max_notional:
+            if max_notional > 0 and notional > max_notional:
                 qty_raw = max_notional / entry_price
                 notional = qty_raw * entry_price
 
@@ -216,10 +247,12 @@ class BinanceFuturesTrader:
                 qty = steps_needed * f["stepSize"]
                 qty = self.round_step_size(qty, f["stepSize"])
 
-            return max(qty, 0.0)
+            sized_qty = max(qty, 0.0)
+            self._last_risk_budget = risk_amount
+            return sized_qty, risk_amount
         except Exception as e:
             print(f"⚠️ sizing error {symbol}: {e}")
-            return 0.0
+            return 0.0, 0.0
 
     # ---------------- Leverage ----------------
 
@@ -241,7 +274,8 @@ class BinanceFuturesTrader:
         entry_price: float,
         sl_price: float,
         tp_prices: List[float],
-        force_market: bool = False
+        force_market: bool = False,
+        risk_amount_usd: Optional[float] = None
     ) -> Optional[Dict]:
         """
         Abre una posición en Binance Futures con SL y múltiples TPs.
@@ -257,7 +291,12 @@ class BinanceFuturesTrader:
             self.set_leverage(symbol, self.leverage)
 
             # Calcular tamaño de posición
-            quantity = self.calculate_position_size(symbol, entry_price, sl_price)
+            quantity, risk_budget = self.calculate_position_size(
+                symbol,
+                entry_price,
+                sl_price,
+                risk_amount_usd=risk_amount_usd
+            )
             if quantity <= 0:
                 print(f"❌ Cantidad calculada inválida: {quantity}")
                 return None
@@ -585,6 +624,8 @@ class BinanceFuturesTrader:
                 else:
                     tp_prices_rounded = []
 
+                risk_amount_effective = abs(actual_entry - sl_price_rounded) * quantity
+
             # ===== RESUMEN =====
             print(f"\n{'='*60}")
             print(f"📋 RESUMEN DE ÓRDENES")
@@ -641,7 +682,9 @@ class BinanceFuturesTrader:
                 'margin_after': margin_after_entry,
                 'margin_used': margin_used,
                 'entry_order_id': str(entry_order.get('orderId')) if isinstance(entry_order, dict) else None,
-                'entry_client_order_id': entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None
+                'entry_client_order_id': entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None,
+                'risk_budget': risk_budget,
+                'risk_amount_effective': risk_amount_effective
             }
 
             print(f"\n{'='*60}")

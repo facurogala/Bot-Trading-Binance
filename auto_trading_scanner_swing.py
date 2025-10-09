@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import requests
 from binance_futures_trader import BinanceFuturesTrader
+from collections import Counter, deque
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
 from auto_closer import AutoCloser
+from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -24,6 +26,11 @@ if not TOKEN or not CHAT_ID:
     raise ValueError("❌ Error: TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no están configurados en .env")
 
 # Configuración de trading
+BOT_NAME = "Swing"
+MESSAGE_PREFIX = "[SWING]"
+DB_PATH = "trading_history.db"
+REPORT_BASENAME = "trading_report_swing"
+
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
@@ -132,6 +139,19 @@ LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 
+RISK_USD_PER_TRADE = env_float(
+    40.0,
+    "RISK_USD_SWING",
+    "RISK_USD_GLOBAL",
+    "RISK_USD_DEFAULT",
+    "RISK_AMOUNT_USD",
+    context="Swing"
+)
+RISK_REWARD_TARGETS = parse_float_list(
+    os.getenv("SWING_R_MULTIPLIERS", os.getenv("RISK_R_MULTIPLIERS_DEFAULT")),
+    default=(1.0, 1.8, 2.5)
+)
+
 # Risk/TP config (compatibilidad con funciones existentes)
 SWING_LOOKBACK = 10
 SL_ATR_BUFFER = 0.2
@@ -143,7 +163,7 @@ _last_trade_time = {}
 _daily_trade_count = {}
 
 # Inicializar base de datos
-db = TradingDatabase("trading_history.db")
+db = TradingDatabase(DB_PATH)
 
 # Inicializar trader
 trader = None
@@ -154,7 +174,7 @@ if AUTO_TRADE_ENABLED:
         print("✅ Trader de Binance Futures inicializado")
         # 🧩 Iniciar AutoCloser (cierre completo tras TP/SL)
         try:
-            auto_closer = AutoCloser(trader, db, bot_name="Swing")
+            auto_closer = AutoCloser(trader, db, bot_name=BOT_NAME)
             auto_closer.start()
         except Exception as e:
             print(f"⚠️ AutoCloser no pudo iniciar: {e}")
@@ -166,41 +186,27 @@ if AUTO_TRADE_ENABLED:
 def generar_reportes_automaticos():
     """Genera todos los reportes automáticamente después de cada escaneo"""
     try:
-        print(f"\n{'='*60}")
-        print("📊 GENERANDO REPORTES AUTOMÁTICOS...")
-        print(f"{'='*60}")
-        
-        # Verificar si hay datos en la base de datos
-        stats = db.get_trade_stats()
-        
-        # 1. Reporte rápido en consola
-        print("\n📈 ESTADÍSTICAS RÁPIDAS:")
-        generate_quick_report("trading_history.db")
-        
-        # 2. Generar dashboard completo si hay trades cerrados
-        if stats['total_trades'] > 0:
-            print("\n📊 Generando gráficos completos (consolidado)...")
-            dashboard = TradingDashboard("trading_history.db")
-            dashboard.generate_consolidated_report(output_dir="reports", filename_base="trading_report_all")
-            print("✅ Gráfico consolidado actualizado: reports/trading_report_all.png")
-        else:
-            print("\n💡 Aún no hay trades cerrados para generar gráficos completos")
-            print("   Los gráficos se generarán cuando se cierren posiciones")
-        
-        print(f"{'='*60}\n")
-        
+        print("\n" + "="*60)
+        print("� GENERANDO REPORTES AUTOMÁTICOS...")
+        print("="*60)
+        print("\n� ESTADÍSTICAS RÁPIDAS:")
+        generate_quick_report(DB_PATH, bot=BOT_NAME)
+        dashboard = TradingDashboard(DB_PATH)
+        dashboard.generate_consolidated_report(output_dir="reports", filename_base=REPORT_BASENAME, bot=BOT_NAME)
+        print(f"✅ Gráfico consolidado actualizado: reports/{REPORT_BASENAME}.png")
+        print("="*60)
     except Exception as e:
         print(f"⚠️ Error al generar reportes: {e}")
 
 def send_telegram(message: str):
+    if not message.startswith(MESSAGE_PREFIX):
+        message = f"{MESSAGE_PREFIX} {message}"
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, data=payload, timeout=10)
-        if r.status_code == 200:
-            print(f"✅ Mensaje enviado a Telegram")
-        else:
-            print(f"⚠️ Error Telegram: {r.status_code}")
+        if r.status_code != 200:
+            print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
     except Exception as e:
         print(f"[WARN] Telegram falló: {e}")
 
@@ -509,10 +515,11 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
     # SL/TP basados en ATR y preset
     if side == "LONG":
         sl = price - SL_ATR_MULT * atr
-        tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
     else:
         sl = price + SL_ATR_MULT * atr
-        tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+
+    risk_distance = abs(price - sl)
+    tps = risk_tp_prices(price, sl, side, RISK_REWARD_TARGETS)
 
     vol_now = float(df["volume"].iloc[-1])
     vol_avg20 = float(df["volume"].tail(20).mean())
@@ -540,6 +547,7 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
         'price': price,
         'decimals': dec,
         'atr': atr,
+        'risk_distance': risk_distance,
         'fib': fib_info,
         'sr': sr_info[-5:] if sr_info else []
     }
@@ -552,7 +560,11 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
     dec = levels['decimals']
     fmt = f"{{:.{dec}f}}"
     
-    status = "🚀 <b>TRADE SWING EJECUTADO</b>" if traded else "📣 <b>SEÑAL SWING</b>"
+    status = (
+        f"{MESSAGE_PREFIX} 🤖 <b>{BOT_NAME} — TRADE EJECUTADO</b>"
+        if traded
+        else f"{MESSAGE_PREFIX} � <b>{BOT_NAME} — SEÑAL DETECTADA</b>"
+    )
     
     entry_str = f"{fmt.format(levels['entry_high'])} - {fmt.format(levels['entry_low'])}"
     tp_lines = "\n".join([f"🟢 TP{i+1}: {fmt.format(t)}" if side == "LONG"
@@ -564,9 +576,7 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
 ⏰ Timeframe: {tf_name}
 
 📍 Zona de Entrada: {entry_str}
-
 {tp_lines}
-
 🔴 SL: {fmt.format(levels['sl_price'])}
 
 💰 Precio Actual: {fmt.format(levels['price'])}
@@ -622,7 +632,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
-            force_market=USE_MARKET_ORDER
+            force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE
         )
         
         if result:
@@ -640,7 +651,7 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     tp_prices=result['tp_prices'],
                     timeframe=timeframe,
                     notes=f"Señal EMA Swing - {timeframe}",
-                    bot="Swing",
+                    bot=BOT_NAME,
                     bot_id=BOT_ID,
                     entry_order_id=result.get('entry_order_id'),
                     entry_client_order_id=result.get('entry_client_order_id'),
@@ -736,123 +747,141 @@ def analyze(symbol, timeframe):
         signal = "SELL"
         side = "SHORT"
 
-    if signal in ("BUY", "SELL"):
-        # Alineación multi-TF
-        if TIMEFRAME_ALIGNMENT and not timeframe_alignment_ok(symbol, side):
-            return None
-        # 🛡️ VERIFICAR FILTROS CONSERVADORES
-        last = last.copy()
-        last['symbol'] = symbol
-        filters = check_filters(side, df, last)
-        
-        if not filters['passed']:
-            # Señal rechazada por filtros
-            print(f"🛡️ {display_symbol(symbol)} [{timeframe}]: Señal {signal} RECHAZADA")
-            for reason in filters['reasons']:
-                print(f"   {reason}")
-            return None
-        
-        # ✅ Señal aprobada por todos los filtros
-        levels = build_levels(side, last, df, symbol, timeframe)
-        # Contabilizar señal aprobada
-        try:
-            db.increment_bot_activity(bot="Swing", approved_delta=1)
-        except Exception:
-            pass
-        
-        # Intentar ejecutar el trade
-        traded = False
-        if AUTO_TRADE_ENABLED:
-            traded = execute_trade(symbol, side, levels, timeframe)
-        
-        # Enviar mensaje a Telegram
-        message = format_trade_message(symbol, side, levels, timeframe, traded, filters)
-        send_telegram(message)
-        if traded:
-            try:
-                db.increment_bot_activity(bot="Swing", executed_delta=1)
-            except Exception:
-                pass
-        
+    if signal not in ("BUY", "SELL"):
+        return {"status": "no_signal"}
+
+    if TIMEFRAME_ALIGNMENT and not timeframe_alignment_ok(symbol, side):
         return {
-            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "rejected",
             "symbol": symbol,
             "timeframe": timeframe,
-            "signal": signal,
             "side": side,
-            "traded": traded,
-            "filters": filters
+            "reasons": ["❌ Alineación TF no válida"],
         }
-    
-    return None
+
+    last = last.copy()
+    last['symbol'] = symbol
+    filters = check_filters(side, df, last)
+
+    if not filters['passed']:
+        return {
+            "status": "rejected",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "side": side,
+            "reasons": filters.get('reasons', []),
+        }
+
+    levels = build_levels(side, last, df, symbol, timeframe)
+    return {
+        "status": "approved",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "side": side,
+        "filters": filters,
+        "levels": levels,
+    }
 
 def scan_once():
     """Escanea todas las cryptos en múltiples timeframes"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n{'='*60}")
-    print(f"🧭 ESCANEO SWING")
+    print("\n" + "="*60)
+    print(f"🧭 ESCANEO {BOT_NAME.upper()}")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
-    print(f"📅 {timestamp}")
-    if AUTO_TRADE_ENABLED:
-        print(f"🤖 TRADING AUTOMÁTICO ACTIVADO")
-    else:
-        print(f"📢 MODO SOLO ALERTAS")
-    print(f"{'='*60}")
-    print(f"🛡️ Filtros activos (Swing):")
+    print(datetime.utcnow().strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
+    print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
+    print("="*60)
+    print(f"🛡️ Filtros activos ({BOT_NAME}):")
     print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Dist EMAs ≥ {MIN_EMA_DISTANCE*100:.2f}% | Slope ≥ {MIN_TREND_SLOPE*100:.2f}%")
-    print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
+    print(f"   ✅ Volumen mínimo: {MIN_VOLUME_RATIO:.2f}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ SL máx: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}–{MAX_ATR_PCT*100:.2f}%]")
     print(f"   ✅ Fib: {'ON' if USE_FIB else 'OFF'} | Confluencias EMA/SR: {CONFLUENCE_WITH_EMA}/{CONFLUENCE_WITH_SR}")
     print(f"   ✅ ADX≥{ADX_MIN} | Estructura HH/HL: {'Sí' if STRUCT_REQUIRE_HH_HL else 'No'}")
-    print(f"   ✅ Scoring min: {MIN_SCORE_TO_TRADE}")
-    print(f"{'='*60}")
-    
-    signals_found = 0
-    trades_executed = 0
-    signals_rejected = 0
-    
+    print(f"   ✅ Score min: {MIN_SCORE_TO_TRADE:.2f}")
+    print("="*60)
+
+    summary = {"detected": 0, "approved": 0, "rejected": 0, "executed": 0}
+    rejection_reasons: Counter[str] = Counter()
+
     for symbol in WATCHLIST:
-        symbol_has_signal = False
-        
-        for timeframe in TIMEFRAMES:
-            try:
-                result = analyze(symbol, timeframe)
-                if result:
-                    tf_name = TIMEFRAME_NAMES.get(timeframe, timeframe)
-                    status = "ejecutado" if result.get('traded') else "detectado"
-                    print(f"✅ {display_symbol(symbol)} [{tf_name}]: {result['signal']} → {status}")
-                    # Detalle adicional: ATR y SL%
+        try:
+            per_symbol_details = []
+            for timeframe in TIMEFRAMES:
+                try:
+                    result = analyze(symbol, timeframe)
+                except ValueError:
+                    continue
+                except Exception as e:
+                    print(f"⚠️ Error analizando {symbol} [{timeframe}]: {e}")
+                    continue
+
+                if not result or result.get("status") == "no_signal":
+                    continue
+
+                summary["detected"] += 1
+
+                status = result.get("status")
+                side = result.get("side")
+                if status == "rejected":
+                    summary["rejected"] += 1
+                    reasons = result.get("reasons", [])
                     try:
-                        lv = result.get('levels', {})
-                        if lv:
-                            sl_pct = abs(lv['price'] - lv['sl_price']) / lv['price'] * 100 if lv['price'] else 0
-                            print(f"   ↳ ATR: {lv.get('atr', 0):.4f} | SL: -{sl_pct:.2f}% | Precio: {lv['price']:.6f}")
+                        print(f"🛡️ {display_symbol(symbol)} [{timeframe}]: Señal {'BUY' if side=='LONG' else 'SELL'} RECHAZADA")
+                        for reason in reasons[:3]:
+                            print(f"   {reason}")
                     except Exception:
                         pass
-                    
-                    signals_found += 1
-                    if result.get('traded'):
-                        trades_executed += 1
-                    
-                    symbol_has_signal = True
-                    time.sleep(1)
-                    
-            except Exception as e:
-                # No mostrar errores normales de "no señal"
-                if "Datos insuficientes" not in str(e):
-                    print(f"❌ {symbol} [{timeframe}]: error → {e}")
-        
-        if not symbol_has_signal:
-            print(f"   {display_symbol(symbol)}: Sin señales aprobadas")
-    
-    print(f"\n✅ Escaneo completado: {signals_found} señal(es) aprobada(s)")
-    if AUTO_TRADE_ENABLED:
-        print(f"🤖 Trades ejecutados: {trades_executed}")
-    
-    # 📊 GENERAR REPORTES AUTOMÁTICAMENTE
+                    if reasons:
+                        rejection_reasons[reasons[0]] += 1
+                    continue
+
+                if status == "approved":
+                    summary["approved"] += 1
+                    levels = result["levels"]
+                    filters = result.get("filters")
+                    per_symbol_details.append(
+                        f"[{timeframe}] {side} | Precio: {levels['entry_price']:.6f}"
+                    )
+                    send_telegram(format_trade_message(symbol, side, levels, timeframe, traded=False, filters=filters))
+                    try:
+                        db.increment_bot_activity(bot=BOT_NAME, approved_delta=1)
+                    except Exception:
+                        pass
+
+                    traded = False
+                    if AUTO_TRADE_ENABLED:
+                        traded = execute_trade(symbol, side, levels, timeframe)
+                    if traded:
+                        summary["executed"] += 1
+                        try:
+                            db.increment_bot_activity(bot=BOT_NAME, executed_delta=1)
+                        except Exception:
+                            pass
+                        send_telegram(format_trade_message(symbol, side, levels, timeframe, traded=True, filters=filters))
+
+                    time.sleep(0.05)
+
+            if per_symbol_details:
+                print(f"   {display_symbol(symbol)}: Señales")
+                for line in per_symbol_details:
+                    print(f"      - {line}")
+            else:
+                print(f"   {display_symbol(symbol)}: Sin señales aprobadas")
+        except Exception as e:
+            print(f"⚠️ Error analizando {symbol}: {e}")
+
+    print(f"\n📊 Resumen [{BOT_NAME.upper()}]:")
+    print(f"   Señales detectadas: {summary['detected']}")
+    print(f"   Señales aprobadas: {summary['approved']}")
+    print(f"   Señales rechazadas: {summary['rejected']}")
+    if rejection_reasons:
+        print("   Principales rechazos:")
+        for reason, count in rejection_reasons.most_common(2):
+            print(f"      - {reason} ({count})")
+    print(f"   Trades ejecutados: {summary['executed']}")
+
     generar_reportes_automaticos()
-    
-    return signals_found, trades_executed
+
+    return summary
 
 def show_positions_summary():
     """Muestra un resumen de las posiciones abiertas"""
@@ -944,9 +973,17 @@ def main():
             cycle += 1
             print(f"\n🔄 Rechequeo #{cycle} iniciado a las {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             t0 = time.time()
-            signals, trades = scan_once()
+            summary = scan_once()
             dt = time.time() - t0
-            print(f"✅ Escaneo #{cycle} finalizado en {dt:.1f}s (señales={signals}, trades={trades})")
+            print(
+                "✅ Escaneo #{cycle} finalizado en {dt:.1f}s (detected={det}, approved={app}, executed={exe})".format(
+                    cycle=cycle,
+                    dt=dt,
+                    det=summary.get("detected", 0),
+                    app=summary.get("approved", 0),
+                    exe=summary.get("executed", 0),
+                )
+            )
             
             # Mostrar posiciones después del escaneo
             show_positions_summary()

@@ -14,6 +14,7 @@ from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
 from trade_monitor import TradeMonitor
+from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -158,6 +159,20 @@ POSITION_SIZE_MULT = 1.0
 LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
+
+RISK_USD_PER_TRADE = env_float(
+    25.0,
+    "RISK_USD_SWING_SCANNER",
+    "RISK_USD_SWING",
+    "RISK_USD_GLOBAL",
+    "RISK_USD_DEFAULT",
+    "RISK_AMOUNT_USD",
+    context="Scanner"
+)
+RISK_REWARD_TARGETS = parse_float_list(
+    os.getenv("SCANNER_R_MULTIPLIERS", os.getenv("RISK_R_MULTIPLIERS_DEFAULT")),
+    default=(1.0, 1.5, 2.0)
+)
 
 # Estado runtime
 _last_trade_time = {}
@@ -421,10 +436,8 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
         sl = recent_highs + sl_buffer * atr
 
     # TPs según ATR preset
-    if side == 'LONG':
-        tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
-    else:
-        tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+    risk_distance = abs(price - sl)
+    tps = risk_tp_prices(price, sl, side, RISK_REWARD_TARGETS)
 
     if vol_ratio < 0.8:
         vol_hint = "Volumen bajo: posible falta de impulso 🟡"
@@ -443,7 +456,8 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
         'vol_hint': vol_hint,
         'price': price,
         'decimals': dec,
-        'atr': atr
+        'atr': atr,
+        'risk_distance': risk_distance
     }
 
 def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str, traded: bool = False):
@@ -503,7 +517,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
-            force_market=USE_MARKET_ORDER
+            force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE
         )
         
         if result:
