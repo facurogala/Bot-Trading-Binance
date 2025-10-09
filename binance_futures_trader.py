@@ -116,6 +116,17 @@ class BinanceFuturesTrader:
             print(f"❌ Error al obtener balance: {e}")
             return 0.0
 
+    def get_margin_balance(self) -> float:
+        """Devuelve el margin balance total reportado por Binance (wallet + PnL no realizado)."""
+        try:
+            account = self.client.futures_account(recvWindow=60000)
+            if account is None:
+                return 0.0
+            return float(account.get('totalMarginBalance') or account.get('totalWalletBalance') or 0.0)
+        except Exception as e:
+            print(f"⚠️ Error al obtener margin balance: {e}")
+            return 0.0
+
     def get_symbol_info(self, symbol: str) -> Dict:
         """Obtiene información del símbolo (precisión, min notional, etc)."""
         try:
@@ -241,6 +252,7 @@ class BinanceFuturesTrader:
           - Compatibilidad hedge mode con positionSide
         """
         try:
+            margin_before = self.get_margin_balance()
             # Configurar apalancamiento
             self.set_leverage(symbol, self.leverage)
 
@@ -439,16 +451,38 @@ class BinanceFuturesTrader:
 
             # Cantidad real (por si hubo fill parcial)
             actual_position_qty = quantity
+            position_id = None
+            isolated_margin = None
+            position_notional = None
             try:
                 positions_info = self.client.futures_position_information(symbol=symbol)
                 for p in positions_info:
-                    if p['symbol'] == symbol:
+                    if p.get('symbol') == symbol:
                         actual_position_qty = abs(float(p.get('positionAmt', 0)))
+                        position_id = str(p.get('positionId') or f"{symbol}-{p.get('positionSide', 'BOTH')}")
+                        try:
+                            isolated_margin = float(p.get('isolatedMargin')) if p.get('isolatedMargin') is not None else None
+                        except Exception:
+                            isolated_margin = None
+                        try:
+                            position_notional = abs(float(p.get('notional'))) if p.get('notional') is not None else None
+                        except Exception:
+                            position_notional = None
                         break
             except Exception:
                 actual_position_qty = quantity
+                position_id = None
 
             quantity = self.round_step_size(actual_position_qty, step_size)
+
+            margin_after_entry = self.get_margin_balance()
+            position_notional = position_notional or (abs(quantity) * actual_entry)
+            margin_used = None
+            try:
+                if self.leverage > 0:
+                    margin_used = position_notional / self.leverage
+            except Exception:
+                margin_used = None
 
             # ========== CREACIÓN DE ÓRDENES SL Y TP ==========
             print(f"\n{'='*60}")
@@ -599,7 +633,15 @@ class BinanceFuturesTrader:
                 'entry_price': actual_entry,
                 'sl_price': sl_price_rounded,
                 'tp_prices': tp_prices_rounded,
-                'leverage': self.leverage
+                'leverage': self.leverage,
+                'position_id': position_id,
+                'isolated_margin': isolated_margin,
+                'position_notional': position_notional,
+                'margin_before': margin_before,
+                'margin_after': margin_after_entry,
+                'margin_used': margin_used,
+                'entry_order_id': str(entry_order.get('orderId')) if isinstance(entry_order, dict) else None,
+                'entry_client_order_id': entry_order.get('clientOrderId') if isinstance(entry_order, dict) else None
             }
 
             print(f"\n{'='*60}")
@@ -671,7 +713,11 @@ class BinanceFuturesTrader:
                         'unrealizedProfit': float(unrealized),
                         'leverage': int(leverage) if leverage else self.leverage,
                         'stopLoss': sl_price,
-                        'takeProfits': tp_prices
+                        'takeProfits': tp_prices,
+                        'position_id': str(pos.get('positionId') or f"{symbol}-{pos.get('positionSide', 'BOTH')}") if symbol else None,
+                        'marginType': pos.get('marginType'),
+                        'isolatedMargin': float(pos.get('isolatedMargin')) if pos.get('isolatedMargin') else None,
+                        'notional': float(pos.get('notional')) if pos.get('notional') else abs(position_amt) * float(pos['entryPrice']) if pos.get('entryPrice') else None
                     })
 
             return open_positions

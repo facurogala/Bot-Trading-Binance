@@ -213,7 +213,16 @@ class AutoCloser:
     def _finalize_trade(self, trade_id: int, symbol: str, exit_price: float, exit_reason: str):
         # Cierra el trade en DB si aún está OPEN
         try:
-            self.db.close_trade(trade_id, exit_price=exit_price, exit_reason=exit_reason)
+            try:
+                margin_exit = self.trader.get_margin_balance()
+            except Exception:
+                margin_exit = None
+            self.db.close_trade(
+                trade_id,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                margin_balance_exit=margin_exit
+            )
         except Exception as e:
             # Si falló por estado ya cerrado, ignorar
             print(f"⚠️ AutoCloser close_trade fallo id={trade_id}: {e}")

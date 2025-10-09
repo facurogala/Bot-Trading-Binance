@@ -98,45 +98,51 @@ class TradingDatabase:
         ''')
         
         conn.commit()
-        # Migración: asegurar que la columna 'bot' exista si la tabla ya existía
+        # Migraciones de columnas adicionales
         try:
             cursor.execute("PRAGMA table_info(trades)")
-            cols = [r[1] for r in cursor.fetchall()]
-            if 'bot' not in cols:
-                cursor.execute("ALTER TABLE trades ADD COLUMN bot TEXT")
-                conn.commit()
-            # Nuevos campos para métricas de inversión
-            cursor.execute("PRAGMA table_info(trades)")
-            cols = [r[1] for r in cursor.fetchall()]
-            if 'notional' not in cols:
-                cursor.execute("ALTER TABLE trades ADD COLUMN notional REAL")
-                conn.commit()
-            cursor.execute("PRAGMA table_info(trades)")
-            cols = [r[1] for r in cursor.fetchall()]
-            if 'risk_usd' not in cols:
-                cursor.execute("ALTER TABLE trades ADD COLUMN risk_usd REAL")
-                conn.commit()
+            cols = {r[1] for r in cursor.fetchall()}
+            trade_alters = {
+                'bot': "ALTER TABLE trades ADD COLUMN bot TEXT",
+                'bot_id': "ALTER TABLE trades ADD COLUMN bot_id TEXT",
+                'notional': "ALTER TABLE trades ADD COLUMN notional REAL",
+                'risk_usd': "ALTER TABLE trades ADD COLUMN risk_usd REAL",
+                'margin_used': "ALTER TABLE trades ADD COLUMN margin_used REAL",
+                'position_id': "ALTER TABLE trades ADD COLUMN position_id TEXT",
+                'entry_order_id': "ALTER TABLE trades ADD COLUMN entry_order_id TEXT",
+                'entry_client_order_id': "ALTER TABLE trades ADD COLUMN entry_client_order_id TEXT",
+                'exit_order_id': "ALTER TABLE trades ADD COLUMN exit_order_id TEXT",
+                'exit_client_order_id': "ALTER TABLE trades ADD COLUMN exit_client_order_id TEXT",
+                'margin_balance_entry': "ALTER TABLE trades ADD COLUMN margin_balance_entry REAL",
+                'margin_balance_post_entry': "ALTER TABLE trades ADD COLUMN margin_balance_post_entry REAL",
+                'margin_balance_exit': "ALTER TABLE trades ADD COLUMN margin_balance_exit REAL",
+                'margin_pnl': "ALTER TABLE trades ADD COLUMN margin_pnl REAL",
+                'isolated_margin': "ALTER TABLE trades ADD COLUMN isolated_margin REAL"
+            }
+            for column, statement in trade_alters.items():
+                if column not in cols:
+                    cursor.execute(statement)
+                    conn.commit()
+                    cols.add(column)
         except Exception:
             pass
 
         # Migración: asegurar columnas de fills en 'orders'
         try:
             cursor.execute("PRAGMA table_info(orders)")
-            ocols = [r[1] for r in cursor.fetchall()]
-            if 'filled_price' not in ocols:
-                cursor.execute("ALTER TABLE orders ADD COLUMN filled_price REAL")
-                conn.commit()
-            cursor.execute("PRAGMA table_info(orders)")
-            ocols = [r[1] for r in cursor.fetchall()]
-            if 'filled_qty' not in ocols:
-                cursor.execute("ALTER TABLE orders ADD COLUMN filled_qty REAL")
-                conn.commit()
-            # Asegurar filled_time existe (para bases antiguas)
-            cursor.execute("PRAGMA table_info(orders)")
-            ocols = [r[1] for r in cursor.fetchall()]
-            if 'filled_time' not in ocols:
-                cursor.execute("ALTER TABLE orders ADD COLUMN filled_time TIMESTAMP")
-                conn.commit()
+            ocols = {r[1] for r in cursor.fetchall()}
+            order_alters = {
+                'filled_price': "ALTER TABLE orders ADD COLUMN filled_price REAL",
+                'filled_qty': "ALTER TABLE orders ADD COLUMN filled_qty REAL",
+                'filled_time': "ALTER TABLE orders ADD COLUMN filled_time TIMESTAMP",
+                'client_order_id': "ALTER TABLE orders ADD COLUMN client_order_id TEXT",
+                'position_id': "ALTER TABLE orders ADD COLUMN position_id TEXT"
+            }
+            for column, statement in order_alters.items():
+                if column not in ocols:
+                    cursor.execute(statement)
+                    conn.commit()
+                    ocols.add(column)
         except Exception:
             pass
 
@@ -332,7 +338,15 @@ class TradingDatabase:
         tp_prices: Optional[List[float]] = None,
         timeframe: Optional[str] = None,
         notes: Optional[str] = None,
-        bot: Optional[str] = None
+        bot: Optional[str] = None,
+        bot_id: Optional[str] = None,
+        entry_order_id: Optional[str] = None,
+        entry_client_order_id: Optional[str] = None,
+        position_id: Optional[str] = None,
+        margin_balance_entry: Optional[float] = None,
+        margin_balance_post_entry: Optional[float] = None,
+        margin_used: Optional[float] = None,
+        isolated_margin: Optional[float] = None
     ) -> int:
         """
         Registra una nueva operación
@@ -355,16 +369,26 @@ class TradingDatabase:
         except Exception:
             risk_usd = None
         
+        if margin_used is None and notional is not None:
+            try:
+                margin_used = float(notional) / float(leverage) if leverage else None
+            except Exception:
+                margin_used = None
+
         cursor.execute('''
             INSERT INTO trades (
                 symbol, side, entry_price, quantity, leverage,
                 sl_price, tp_prices, entry_time, status, timeframe, notes, bot,
-                notional, risk_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                bot_id, notional, risk_usd, margin_used, position_id,
+                entry_order_id, entry_client_order_id,
+                margin_balance_entry, margin_balance_post_entry, isolated_margin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             symbol, side, entry_price, quantity, leverage,
             sl_price, tp_prices_json, entry_time, 'OPEN', timeframe, notes, bot,
-            notional, risk_usd
+            bot_id, notional, risk_usd, margin_used, position_id,
+            entry_order_id, entry_client_order_id,
+            margin_balance_entry, margin_balance_post_entry, isolated_margin
         ))
         
         trade_id = cursor.lastrowid
@@ -430,7 +454,9 @@ class TradingDatabase:
         symbol: str,
         price: Optional[float] = None,
         quantity: Optional[float] = None,
-        status: str = "NEW"
+        status: str = "NEW",
+        client_order_id: Optional[str] = None,
+        position_id: Optional[str] = None
     ):
         """Registra una orden individual asociada a un trade"""
         conn = sqlite3.connect(self.db_path)
@@ -441,11 +467,11 @@ class TradingDatabase:
         cursor.execute('''
             INSERT INTO orders (
                 trade_id, order_id, order_type, side, symbol,
-                price, quantity, status, created_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                price, quantity, status, created_time, client_order_id, position_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             trade_id, order_id, order_type, side, symbol,
-            price, quantity, status, created_time
+            price, quantity, status, created_time, client_order_id, position_id
         ))
         conn.commit()
         conn.close()
@@ -490,7 +516,10 @@ class TradingDatabase:
         self,
         trade_id: int,
         exit_price: float,
-        exit_reason: str = "MANUAL"
+        exit_reason: str = "MANUAL",
+        exit_order_id: Optional[str] = None,
+        exit_client_order_id: Optional[str] = None,
+        margin_balance_exit: Optional[float] = None
     ):
         """Cierra un trade y calcula el PnL correctamente.
 
@@ -500,42 +529,45 @@ class TradingDatabase:
         - pnl_percent (%): ROE% aproximado = retorno de precio con signo multiplicado por leverage
         """
         conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        # Obtener datos del trade
+
         cursor.execute('SELECT * FROM trades WHERE id = ?', (trade_id,))
-        trade = cursor.fetchone()
-        
-        if not trade:
+        row = cursor.fetchone()
+
+        if not row:
             conn.close()
             print(f"⚠️ Trade {trade_id} no encontrado")
             return
-        
-        # Verificar si ya está cerrado
-        if trade[11] == 'CLOSED':  # status column
+
+        trade = dict(row)
+
+        status = (trade.get('status') or '').upper()
+        if status == 'CLOSED':
             conn.close()
             print(f"⚠️ Trade {trade_id} ya está cerrado")
             return
-        
-        # Validar exit_price
+
         if exit_price <= 0:
             conn.close()
             print(f"⚠️ Precio de salida inválido: {exit_price}")
             return
-        
-    # Calcular PnL correcto
-        entry_price = float(trade[3])  # entry_price
-        quantity = float(trade[5])      # quantity
-        leverage = int(trade[6]) if trade[6] is not None else 1  # leverage
-        side = str(trade[2]).upper()    # side
 
-        # Validaciones
+        try:
+            entry_price = float(trade.get('entry_price'))
+            quantity = float(trade.get('quantity'))
+            leverage = int(trade.get('leverage') or 1)
+            side = str(trade.get('side') or '').upper()
+        except Exception:
+            conn.close()
+            print(f"⚠️ Datos inválidos para cierre de trade {trade_id}")
+            return
+
         if entry_price <= 0 or quantity <= 0:
             conn.close()
             print(f"⚠️ Datos inválidos - Entry: {entry_price}, Qty: {quantity}")
             return
 
-        # Intentar usar fills de órdenes para calcular PnL exacto
         pnl = None
         avg_exit = None
         try:
@@ -571,7 +603,6 @@ class TradingDatabase:
                 weighted_px_sum += fp * fq
                 total_qty += fq
 
-            # Si hubo fills, considerar posible resto con exit_price (por AutoCloser)
             remaining_qty = max(quantity - total_qty, 0.0)
             if total_qty > 0.0:
                 if remaining_qty > 0.0 and exit_price > 0:
@@ -588,40 +619,71 @@ class TradingDatabase:
             pnl = None
             avg_exit = None
 
-        # Si no hay fills, usar fórmula básica con el exit_price recibido
         if pnl is None:
             if side == "LONG":
                 pnl = (exit_price - entry_price) * quantity
-            else:  # SHORT
+            else:
                 pnl = (entry_price - exit_price) * quantity
             avg_exit = exit_price
 
-        # ROE% aproximado con precio promedio de salida
         price_ret = ((avg_exit - entry_price) / entry_price)
         if side == "SHORT":
             price_ret = -price_ret
         pnl_percent = price_ret * leverage * 100.0
-        
+
+        margin_entry_ref = None
+        try:
+            if trade.get('margin_balance_entry') is not None:
+                margin_entry_ref = float(trade.get('margin_balance_entry'))
+            elif trade.get('margin_balance_post_entry') is not None:
+                margin_entry_ref = float(trade.get('margin_balance_post_entry'))
+        except Exception:
+            margin_entry_ref = None
+
+        margin_pnl = None
+        if margin_entry_ref is not None and margin_balance_exit is not None:
+            try:
+                margin_pnl = float(margin_balance_exit) - float(margin_entry_ref)
+            except Exception:
+                margin_pnl = None
+
         exit_time = datetime.now()
-        
-        # Actualizar el trade
-        cursor.execute('''
-            UPDATE trades 
-            SET exit_price = ?, exit_time = ?, status = 'CLOSED',
-                pnl = ?, pnl_percent = ?, exit_reason = ?
-            WHERE id = ? AND status = 'OPEN'
-        ''', (avg_exit, exit_time, pnl, pnl_percent, exit_reason, trade_id))
-        
+
+        update_fields = [
+            ('exit_price', avg_exit),
+            ('exit_time', exit_time),
+            ('status', 'CLOSED'),
+            ('pnl', pnl),
+            ('pnl_percent', pnl_percent),
+            ('exit_reason', exit_reason)
+        ]
+        if exit_order_id is not None:
+            update_fields.append(('exit_order_id', exit_order_id))
+        if exit_client_order_id is not None:
+            update_fields.append(('exit_client_order_id', exit_client_order_id))
+        if margin_balance_exit is not None:
+            update_fields.append(('margin_balance_exit', margin_balance_exit))
+        if margin_pnl is not None:
+            update_fields.append(('margin_pnl', margin_pnl))
+
+        set_clause = ', '.join(f"{col} = ?" for col, _ in update_fields)
+        params = [val for _, val in update_fields]
+        params.append(trade_id)
+
+        cursor.execute(
+            f"UPDATE trades SET {set_clause} WHERE id = ? AND status = 'OPEN'",
+            tuple(params)
+        )
+
         rows_affected = cursor.rowcount
         conn.commit()
         conn.close()
-        
+
         if rows_affected > 0:
-            symbol = trade[1]  # symbol column
+            symbol = trade.get('symbol')
             pnl_icon = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
-            print(f"✅ Trade {trade_id} ({symbol}) cerrado: {pnl_icon} ${pnl:.2f} ({pnl_percent:+.2f}%) - {exit_reason}")
-            
-            # Actualizar estadísticas diarias
+            margin_msg = f" | ΔMargin: {margin_pnl:+.2f}" if margin_pnl is not None else ""
+            print(f"✅ Trade {trade_id} ({symbol}) cerrado: {pnl_icon} ${pnl:.2f} ({pnl_percent:+.2f}%) - {exit_reason}{margin_msg}")
             self.update_daily_stats()
         else:
             print(f"⚠️ Trade {trade_id} no pudo cerrarse (ya estaba cerrado o no existe)")

@@ -44,6 +44,7 @@ def _float_env(default, *keys):
 
 BOT_NAME = "ScalpingLax"
 MESSAGE_PREFIX = "[LAX]"
+BOT_ID = os.getenv("BOT_ID_SCALPING_LAX") or f"LAX-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 if not TOKEN or not CHAT_ID:
@@ -534,7 +535,15 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 tp_prices=result['tp_prices'],
                 timeframe=timeframe,
                 notes=f"Señal ScalpingLax - {timeframe}",
-                bot="ScalpingLax"
+                bot="ScalpingLax",
+                bot_id=BOT_ID,
+                entry_order_id=result.get('entry_order_id'),
+                entry_client_order_id=result.get('entry_client_order_id'),
+                position_id=result.get('position_id'),
+                margin_balance_entry=result.get('margin_before'),
+                margin_balance_post_entry=result.get('margin_after'),
+                margin_used=result.get('margin_used'),
+                isolated_margin=result.get('isolated_margin')
             )
             # Guardar orden de entrada con precio promedio si existe
             entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
@@ -550,7 +559,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 symbol=symbol,
                 price=entry_price_record,
                 quantity=result['quantity'],
-                status=result['entry_order'].get("status","NEW")
+                status=result['entry_order'].get("status","NEW"),
+                client_order_id=result['entry_order'].get('clientOrderId'),
+                position_id=result.get('position_id')
             )
             if result.get('sl_order'):
                 db.add_order(
@@ -561,18 +572,23 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     symbol=symbol,
                     price=result['sl_price'],
                     quantity=result['quantity'],
-                    status=result['sl_order'].get("status","NEW")
+                    status=result['sl_order'].get("status","NEW"),
+                    client_order_id=result['sl_order'].get('clientOrderId'),
+                    position_id=result.get('position_id')
                 )
             for i, tp_order in enumerate(result.get('tp_orders', []), 1):
+                tp_price = tp_order.get('stopPrice') or tp_order.get('price') or (result['tp_prices'][i-1] if i-1 < len(result['tp_prices']) else None)
                 db.add_order(
                     trade_id=trade_id,
                     order_id=str(tp_order['orderId']),
                     order_type=f"TAKE_PROFIT_{i}",
                     side=tp_order['side'],
                     symbol=symbol,
-                    price=tp_order.get('price'),
+                    price=tp_price,
                     quantity=result['quantity'],
-                    status=tp_order.get("status","NEW")
+                    status=tp_order.get("status","NEW"),
+                    client_order_id=tp_order.get('clientOrderId'),
+                    position_id=result.get('position_id')
                 )
             day_stats["executed"] = day_stats.get("executed", 0) + 1
             _daily_trade_count[day] = day_stats

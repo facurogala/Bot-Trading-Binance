@@ -91,7 +91,9 @@ class TradeMonitor:
                 'entry_price': float(trade['entry_price']),
                 'sl_price': float(trade.get('sl_price', 0)) if trade.get('sl_price') else None,
                 'tp_prices': trade.get('tp_prices', []),
-                'registered_at': datetime.now()
+                'registered_at': datetime.now(),
+                'last_exit_order_id': None,
+                'last_exit_client_id': None
             }
             
             print(f"✅ TradeMonitor: Registrado {symbol} (ID: {trade_id})")
@@ -116,7 +118,9 @@ class TradeMonitor:
                     'entry_price': float(trade['entry_price']),
                     'sl_price': float(trade.get('sl_price', 0)) if trade.get('sl_price') else None,
                     'tp_prices': trade.get('tp_prices', []),
-                    'registered_at': datetime.now()
+                    'registered_at': datetime.now(),
+                    'last_exit_order_id': None,
+                    'last_exit_client_id': None
                 }
             
             if self._tracked_positions:
@@ -163,12 +167,19 @@ class TradeMonitor:
                     try:
                         exit_price = self._get_exit_price(symbol, tracked)
                         exit_reason = self._determine_exit_reason(symbol, tracked, exit_price)
+                        try:
+                            margin_exit = self.trader.get_margin_balance()
+                        except Exception:
+                            margin_exit = None
                         
                         # Cerrar en DB
                         self.db.close_trade(
                             trade_id=tracked['trade_id'],
                             exit_price=exit_price,
-                            exit_reason=exit_reason
+                            exit_reason=exit_reason,
+                            exit_order_id=tracked.get('last_exit_order_id'),
+                            exit_client_order_id=tracked.get('last_exit_client_id'),
+                            margin_balance_exit=margin_exit
                         )
                         
                         print(f"✅ TradeMonitor: Trade cerrado - {symbol} @ {exit_price:.6f} ({exit_reason})")
@@ -235,6 +246,11 @@ class TradeMonitor:
                                         )
                                     except Exception as _e:
                                         pass
+
+                                    tracked = self._tracked_positions.get(symbol)
+                                    if tracked is not None:
+                                        tracked['last_exit_order_id'] = order_id
+                                        tracked['last_exit_client_id'] = order.get('clientOrderId')
 
                                     # Actualizar órdenes procesadas
                                     self._processed_orders.add(order_id)

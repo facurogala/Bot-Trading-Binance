@@ -28,6 +28,8 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 
+BOT_ID = os.getenv("BOT_ID_SWING") or f"SWING-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+
 # Timeframes Swing
 TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
 TIMEFRAME_NAMES = {
@@ -638,7 +640,15 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     tp_prices=result['tp_prices'],
                     timeframe=timeframe,
                     notes=f"Señal EMA Swing - {timeframe}",
-                    bot="Swing"
+                    bot="Swing",
+                    bot_id=BOT_ID,
+                    entry_order_id=result.get('entry_order_id'),
+                    entry_client_order_id=result.get('entry_client_order_id'),
+                    position_id=result.get('position_id'),
+                    margin_balance_entry=result.get('margin_before'),
+                    margin_balance_post_entry=result.get('margin_after'),
+                    margin_used=result.get('margin_used'),
+                    isolated_margin=result.get('isolated_margin')
                 )
                 
                 # Registrar órdenes individuales
@@ -655,7 +665,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     symbol=symbol,
                     price=entry_price_record,
                     quantity=result['quantity'],
-                    status=result['entry_order'].get('status', 'FILLED')
+                    status=result['entry_order'].get('status', 'FILLED'),
+                    client_order_id=result['entry_order'].get('clientOrderId'),
+                    position_id=result.get('position_id')
                 )
                 
                 db.add_order(
@@ -666,7 +678,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     symbol=symbol,
                     price=result['sl_price'],
                     quantity=result['quantity'],
-                    status=result['sl_order'].get('status', 'NEW')
+                    status=result['sl_order'].get('status', 'NEW'),
+                    client_order_id=result['sl_order'].get('clientOrderId'),
+                    position_id=result.get('position_id')
                 )
                 
                 for i, tp_order in enumerate(result['tp_orders'], 1):
@@ -680,7 +694,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                         symbol=symbol,
                         price=tp_price,
                         quantity=tp_qty,
-                        status=tp_order.get('status', 'NEW')
+                        status=tp_order.get('status', 'NEW'),
+                        client_order_id=tp_order.get('clientOrderId'),
+                        position_id=result.get('position_id')
                     )
                 
                 print(f"📊 Trade registrado en DB: ID={trade_id}")
