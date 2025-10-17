@@ -35,7 +35,7 @@ AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
 
-BOT_ID = os.getenv("BOT_ID_SWING") or f"SWING-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+BOT_ID = os.getenv("BOT_ID_SWING") or f"SWING-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 
 # Timeframes Swing
 TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
@@ -170,7 +170,7 @@ trader = None
 auto_closer = None
 if AUTO_TRADE_ENABLED:
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context=BOT_NAME)
         print("✅ Trader de Binance Futures inicializado")
         # 🧩 Iniciar AutoCloser (cierre completo tras TP/SL)
         try:
@@ -178,6 +178,12 @@ if AUTO_TRADE_ENABLED:
             auto_closer.start()
         except Exception as e:
             print(f"⚠️ AutoCloser no pudo iniciar: {e}")
+        if hasattr(trader, 'reconciler') and trader.reconciler:
+            try:
+                daemon_interval = int(os.getenv("PROTECTION_DAEMON_INTERVAL", "60"))
+                trader.reconciler.start_protection_daemon(db, interval=daemon_interval, bot_name=BOT_NAME)
+            except Exception as e:
+                print(f"⚠️ Protection daemon no pudo iniciar: {e}")
     except Exception as e:
         print(f"❌ Error al inicializar trader: {e}")
         print("⚠️ El bot funcionará solo en modo alerta (sin trading)")
@@ -198,17 +204,17 @@ def generar_reportes_automaticos():
     except Exception as e:
         print(f"⚠️ Error al generar reportes: {e}")
 
+from notifier import send_telegram as _notifier_send
+
+
 def send_telegram(message: str):
     if not message.startswith(MESSAGE_PREFIX):
         message = f"{MESSAGE_PREFIX} {message}"
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
+        return _notifier_send(message)
     except Exception as e:
-        print(f"[WARN] Telegram falló: {e}")
+        print(f"[WARN] notifier.send_telegram falló: {e}")
+        return False
 
 def decimals_for(symbol: str) -> int:
     if symbol.endswith("USDT"):
@@ -611,115 +617,54 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
             return False
 
-        # Verificar número de posiciones abiertas
-        open_positions = trader.get_open_positions()
-        
-        # Verificar si ya hay una posición en este símbolo
-        for pos in open_positions:
-            if pos['symbol'] == symbol:
-                print(f"⚠️ Ya existe una posición abierta en {symbol}, omitiendo...")
-                return False
-        
         max_conc = min(MAX_CONCURRENT_POS, MAX_POSITIONS)
-        if len(open_positions) >= max_conc:
-            print(f"⚠️ Máximo de posiciones alcanzado ({max_conc}), omitiendo...")
-            return False
-        
-        # Ejecutar la orden
-        result = trader.open_position(
+
+        execution = trader.execute_protected_entry(
             symbol=symbol,
             side=side,
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
+            db=db,
+            bot_name=BOT_NAME,
+            bot_id=BOT_ID,
+            timeframe=timeframe,
+            notes=f"Señal EMA Swing - {timeframe}",
             force_market=USE_MARKET_ORDER,
-            risk_amount_usd=RISK_USD_PER_TRADE
+            risk_amount_usd=RISK_USD_PER_TRADE,
+            context="auto_trading_scanner_swing",
+            max_positions=max_conc
         )
-        
-        if result:
-            print(f"✅ Trade ejecutado: {symbol} {side}")
-            
-            # 📊 Registrar en la base de datos
-            try:
-                trade_id = db.add_trade(
-                    symbol=symbol,
-                    side=side,
-                    entry_price=result['entry_price'],
-                    quantity=result['quantity'],
-                    leverage=result['leverage'],
-                    sl_price=result['sl_price'],
-                    tp_prices=result['tp_prices'],
-                    timeframe=timeframe,
-                    notes=f"Señal EMA Swing - {timeframe}",
-                    bot=BOT_NAME,
-                    bot_id=BOT_ID,
-                    entry_order_id=result.get('entry_order_id'),
-                    entry_client_order_id=result.get('entry_client_order_id'),
-                    position_id=result.get('position_id'),
-                    margin_balance_entry=result.get('margin_before'),
-                    margin_balance_post_entry=result.get('margin_after'),
-                    margin_used=result.get('margin_used'),
-                    isolated_margin=result.get('isolated_margin')
-                )
-                
-                # Registrar órdenes individuales
-                entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
-                try:
-                    entry_price_record = float(entry_price_record)
-                except Exception:
-                    entry_price_record = result['entry_price']
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['entry_order']['orderId']),
-                    order_type="ENTRY",
-                    side=result['entry_order']['side'],
-                    symbol=symbol,
-                    price=entry_price_record,
-                    quantity=result['quantity'],
-                    status=result['entry_order'].get('status', 'FILLED'),
-                    client_order_id=result['entry_order'].get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
-                
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['sl_order']['orderId']),
-                    order_type="STOP_LOSS",
-                    side=result['sl_order']['side'],
-                    symbol=symbol,
-                    price=result['sl_price'],
-                    quantity=result['quantity'],
-                    status=result['sl_order'].get('status', 'NEW'),
-                    client_order_id=result['sl_order'].get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
-                
-                for i, tp_order in enumerate(result['tp_orders'], 1):
-                    tp_price = tp_order.get('stopPrice') or tp_order.get('price') or result['tp_prices'][i-1]
-                    tp_qty = tp_order.get('origQty') or result['quantity']
-                    db.add_order(
-                        trade_id=trade_id,
-                        order_id=str(tp_order['orderId']),
-                        order_type=f"TAKE_PROFIT_{i}",
-                        side=tp_order['side'],
-                        symbol=symbol,
-                        price=tp_price,
-                        quantity=tp_qty,
-                        status=tp_order.get('status', 'NEW'),
-                        client_order_id=tp_order.get('clientOrderId'),
-                        position_id=result.get('position_id')
-                    )
-                
-                print(f"📊 Trade registrado en DB: ID={trade_id}")
-                _last_trade_time[key] = now
-                _daily_trade_count[day] = cnt + 1
-            except Exception as e:
-                print(f"⚠️ Error al registrar en DB: {e}")
-            
-            return True
-        else:
+
+        if not execution:
             print(f"❌ No se pudo ejecutar el trade en {symbol}")
             return False
+
+        trade_id = execution['trade_id']
+
+        if trade_monitor:
+            try:
+                trade_monitor.register_trade(symbol, trade_id)
+            except Exception as e:
+                print(f"⚠️ Error registrando en TradeMonitor: {e}")
+
+        if hasattr(trader, 'reconciler') and trader.reconciler:
+            enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+            if enable_monitoring:
+                monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
+                monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
+
+                trader.reconciler.start_monitoring(
+                    symbol=symbol,
+                    trade_id=trade_id,
+                    duration_seconds=monitor_duration,
+                    check_interval=monitor_interval
+                )
+
+        print(f"✅ Trade ejecutado: {symbol} {side} (ID={trade_id})")
+        _last_trade_time[key] = now
+        _daily_trade_count[day] = cnt + 1
+        return True
             
     except Exception as e:
         print(f"❌ Error al ejecutar trade: {e}")
@@ -787,7 +732,7 @@ def scan_once():
     print("\n" + "="*60)
     print(f"🧭 ESCANEO {BOT_NAME.upper()}")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
-    print(datetime.utcnow().strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
+    print(datetime.now(timezone.utc).strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
     print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
     print("="*60)
     print(f"🛡️ Filtros activos ({BOT_NAME}):")

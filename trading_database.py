@@ -4,20 +4,38 @@ Guarda todas las operaciones y permite análisis histórico
 """
 import sqlite3
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 import json
+import time
+import functools
 
 class TradingDatabase:
     def __init__(self, db_path: str = "trading_history.db"):
         """Inicializa la base de datos"""
         self.db_path = db_path
+        # Número de reintentos para escrituras cuando la BD está bloqueada
+        self._db_write_retries = int(os.getenv("DB_WRITE_RETRIES", "6"))
+        self._db_retry_backoff = float(os.getenv("DB_RETRY_BACKOFF", "0.08"))
         self.init_database()
     
     def init_database(self):
         """Crea las tablas necesarias si no existen"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         cursor = conn.cursor()
+        try:
+            # Enable WAL for better concurrent writes from multiple processes
+            cursor.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        try:
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON;")
+        except Exception:
+            pass
         
         # Tabla de trades (posiciones abiertas y cerradas)
         cursor.execute('''
@@ -96,6 +114,39 @@ class TradingDatabase:
                 PRIMARY KEY (date, bot)
             )
         ''')
+
+        # Tabla de intentos de entrada (auditoría de aperturas)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS entry_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                bot TEXT,
+                bot_id TEXT,
+                requested_at TIMESTAMP NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                context TEXT,
+                metadata TEXT,
+                completed_at TIMESTAMP,
+                trade_id INTEGER,
+                entry_order_id TEXT,
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            )
+        ''')
+
+        # Tabla de eventos/auditoría
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_time TIMESTAMP NOT NULL,
+                payload TEXT,
+                details TEXT,
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            )
+        ''')
         
         conn.commit()
         # Migraciones de columnas adicionales
@@ -158,6 +209,32 @@ class TradingDatabase:
         conn.close()
         print(f"✅ Base de datos inicializada: {self.db_path}")
 
+    def _connect(self):
+        """Helper para abrir una conexión con parámetros apropiados."""
+        return sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+
+    def _with_db_retry(self, fn):
+        """Decorador local para reintentar operaciones de escritura cuando la BD está bloqueada."""
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(self._db_write_retries):
+                try:
+                    return fn(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    last_exc = exc
+                    msg = str(exc).lower()
+                    if 'database is locked' in msg or 'database table is locked' in msg:
+                        backoff = self._db_retry_backoff * (1 + attempt * 0.5)
+                        time.sleep(backoff)
+                        continue
+                    raise
+            # If we exhausted retries, raise the last exception
+            if last_exc:
+                raise last_exc
+            return None
+        return wrapper
+
     # ===== Bot Activity (aprobadas/ejecutadas) =====
     def increment_bot_activity(self, bot: str, approved_delta: int = 0, executed_delta: int = 0, the_date: Optional[str] = None) -> None:
         """Incrementa contadores diarios de actividad por bot.
@@ -171,29 +248,38 @@ class TradingDatabase:
         if approved_delta == 0 and executed_delta == 0:
             return
         if the_date is None:
-            the_date = datetime.utcnow().strftime('%Y-%m-%d')
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO bot_activity (date, bot, approved_count, executed_count)
-            VALUES (?, ?, 0, 0)
-            ON CONFLICT(date, bot) DO NOTHING
-        ''', (the_date, bot))
-        cursor.execute('''
-            UPDATE bot_activity
-            SET approved_count = approved_count + ?,
-                executed_count = executed_count + ?
-            WHERE date = ? AND bot = ?
-        ''', (approved_delta, executed_delta, the_date, bot))
-        conn.commit()
-        conn.close()
+            the_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        attempts = 0
+        while True:
+            try:
+                conn = self._connect()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO bot_activity (date, bot, approved_count, executed_count)
+                    VALUES (?, ?, 0, 0)
+                    ON CONFLICT(date, bot) DO NOTHING
+                ''', (the_date, bot))
+                cursor.execute('''
+                    UPDATE bot_activity
+                    SET approved_count = approved_count + ?,
+                        executed_count = executed_count + ?
+                    WHERE date = ? AND bot = ?
+                ''', (approved_delta, executed_delta, the_date, bot))
+                conn.commit()
+                conn.close()
+                break
+            except sqlite3.OperationalError as exc:
+                attempts += 1
+                if attempts >= self._db_write_retries:
+                    raise
+                time.sleep(self._db_retry_backoff * attempts)
 
     def get_bot_activity(self, bot: Optional[str] = None, days: int = 30) -> List[Dict]:
         """Devuelve serie de actividad por día (últimos 'days' días)."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        since = (datetime.utcnow().date()).toordinal() - days
+        since = (datetime.now(timezone.utc).date()).toordinal() - days
         # SQLite no soporta fácilmente date - N; usamos comparación string con >= date('now','-N days')
         if bot:
             cursor.execute(
@@ -258,7 +344,7 @@ class TradingDatabase:
 
     def get_bot_weekly_kpis(self, bot: str, days: int = 7) -> Dict[str, float]:
         """Calcula KPIs clave de los últimos `days` días para un bot."""
-        since_ts = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        since_ts = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         trades = self.get_closed_trades(bot=bot, since=since_ts)
 
         total_trades = len(trades)
@@ -354,9 +440,9 @@ class TradingDatabase:
         Returns:
             ID del trade creado
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
-        
+
         tp_prices_json = json.dumps(tp_prices) if tp_prices else None
         entry_time = datetime.now()
         # Métricas de inversión
@@ -394,7 +480,7 @@ class TradingDatabase:
         trade_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        
+
         print(f"✅ Trade registrado: ID={trade_id}, {symbol} {side} @ {entry_price}")
         return trade_id
 
@@ -459,11 +545,11 @@ class TradingDatabase:
         position_id: Optional[str] = None
     ):
         """Registra una orden individual asociada a un trade"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
-        
+
         created_time = datetime.now()
-        
+
         cursor.execute('''
             INSERT INTO orders (
                 trade_id, order_id, order_type, side, symbol,
@@ -475,6 +561,134 @@ class TradingDatabase:
         ))
         conn.commit()
         conn.close()
+
+    def create_entry_attempt(
+        self,
+        symbol: str,
+        side: str,
+        bot: Optional[str] = None,
+        bot_id: Optional[str] = None,
+        context: Optional[str] = None,
+        metadata: Optional[Dict] = None
+    ) -> int:
+        """Inserta un intento de entrada en estado PENDING."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        requested_at = datetime.now()
+        metadata_json = json.dumps(metadata) if metadata else None
+        cursor.execute('''
+            INSERT INTO entry_attempts (
+                symbol, side, bot, bot_id, requested_at, status, context, metadata
+            ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+        ''', (symbol, side, bot, bot_id, requested_at, context, metadata_json))
+        attempt_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return attempt_id
+
+    def finish_entry_attempt(
+        self,
+        attempt_id: int,
+        status: str,
+        reason: Optional[str] = None,
+        trade_id: Optional[int] = None,
+        entry_order_id: Optional[str] = None,
+        metadata: Optional[Dict] = None
+    ) -> None:
+        """Actualiza un intento de entrada con el resultado final."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        completed_at = datetime.now()
+        metadata_json = json.dumps(metadata) if metadata else None
+        cursor.execute('''
+            UPDATE entry_attempts
+            SET status = ?, reason = ?, completed_at = ?, trade_id = ?, entry_order_id = ?, metadata = COALESCE(?, metadata)
+            WHERE id = ?
+        ''', (status, reason, completed_at, trade_id, entry_order_id, metadata_json, attempt_id))
+        conn.commit()
+        conn.close()
+
+    def log_trade_event(
+        self,
+        trade_id: Optional[int],
+        event_type: str,
+        details: Optional[str] = None,
+        payload: Optional[Dict] = None,
+        event_time: Optional[datetime] = None
+    ) -> int:
+        """Registra un evento/auditoría relacionado con un trade."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        when = event_time or datetime.now()
+        payload_json = json.dumps(payload) if payload else None
+        cursor.execute('''
+            INSERT INTO trade_events (trade_id, event_type, event_time, payload, details)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (trade_id, event_type, when, payload_json, details))
+        event_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return event_id
+
+    def log_sl_update(
+        self,
+        trade_id: int,
+        old_sl: Optional[float],
+        new_sl: float,
+        trigger: str,
+        order_id: Optional[str] = None,
+        extra: Optional[Dict] = None
+    ) -> None:
+        """Audita movimiento de SL dinámico."""
+        payload = {
+            "old_sl": old_sl,
+            "new_sl": new_sl,
+            "trigger": trigger,
+            "order_id": order_id
+        }
+        if extra:
+            payload.update(extra)
+        self.log_trade_event(
+            trade_id=trade_id,
+            event_type="SL_UPDATE",
+            payload=payload
+        )
+
+    def get_order_by_id(self, order_id: str) -> Optional[Dict]:
+        """Retrieve a single order by its Binance order_id."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM orders WHERE order_id = ?', (str(order_id),))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def update_order_status(self, order_id: str, status: str, timestamp: Optional[datetime] = None) -> None:
+        """Update status (and optionally timestamp) of an order."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        params = [status]
+        set_clause = "status = ?"
+        if timestamp is None:
+            if status.upper() == "CANCELLED":
+                timestamp = datetime.now()
+        if timestamp is not None:
+            set_clause += ", filled_time = ?"
+            params.append(timestamp)
+        params.append(str(order_id))
+        cursor.execute(f"UPDATE orders SET {set_clause} WHERE order_id = ?", params)
+        conn.commit()
+        conn.close()
+
+    def update_trade_sl(self, trade_id: int, sl_price: float) -> None:
+        """Persist the latest stop-loss price for a trade."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE trades SET sl_price = ? WHERE id = ?', (float(sl_price), int(trade_id)))
+        conn.commit()
+        conn.close()
+
     def update_order_fill(self, order_id: str, filled_price: Optional[float] = None, filled_qty: Optional[float] = None, filled_time: Optional[str] = None, status: Optional[str] = None) -> None:
         """Actualiza información de fill para una orden por order_id.
 
@@ -485,7 +699,7 @@ class TradingDatabase:
             filled_time: Timestamp ISO o datetime para la ejecución
             status: Nuevo estado (por defecto 'FILLED' si se proveen fills)
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         set_parts = []
         params: list = []
@@ -528,7 +742,7 @@ class TradingDatabase:
           SHORT: (entry - exit) * qty
         - pnl_percent (%): ROE% aproximado = retorno de precio con signo multiplicado por leverage
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
@@ -943,9 +1157,9 @@ class TradingDatabase:
     
     def update_daily_stats(self):
         """Actualiza las estadísticas del día actual"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
-        
+
         today = datetime.now().date()
         
         # Obtener trades del día
@@ -978,7 +1192,6 @@ class TradingDatabase:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (today, total_trades, winning_trades, losing_trades,
               total_pnl, win_rate, best_trade, worst_trade))
-        
         conn.commit()
         conn.close()
     
@@ -1054,7 +1267,7 @@ class TradingDatabase:
         """Inicia o reinicia la sesión (baseline) de un bot desde 'start_time' (o ahora)."""
         if start_time is None:
             start_time = datetime.now()
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR REPLACE INTO bot_sessions (bot, start_time) VALUES (?, ?)",
@@ -1065,7 +1278,7 @@ class TradingDatabase:
 
     def clear_bot_session(self, bot: str) -> None:
         """Elimina la sesión (baseline) de un bot."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM bot_sessions WHERE bot = ?", (bot,))
         conn.commit()

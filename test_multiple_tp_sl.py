@@ -17,7 +17,7 @@ def test_order_creation(symbol: str = None):
     
     try:
         # Inicializar trader
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="test_multiple_tp_sl")
         
         # Si no se proporciona símbolo, permitir elegir
         if not symbol:

@@ -23,7 +23,7 @@ def add_protection_to_position(symbol: str, manual_sl: float = None, manual_tps:
     print("="*60)
     
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="add_protection")
         
         # Obtener información de la posición
         positions = trader.client.futures_position_information(symbol=symbol)
@@ -186,7 +186,7 @@ def protect_all_positions():
     print("="*60)
     
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="add_protection")
         
         # Obtener todas las posiciones
         positions = trader.client.futures_position_information()

@@ -10,13 +10,14 @@ Más frecuencia manteniendo control de riesgo:
 """
 
 import os
+import random
 import time
 from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from binance.client import Client
 
@@ -24,6 +25,8 @@ from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
 from auto_closer import AutoCloser
+from trade_monitor import TradeMonitor
+from trailing_stop_manager import TrailingStopManager, TrailingConfig
 
 # ================== CONFIG ==================
 load_dotenv()
@@ -44,7 +47,9 @@ def _float_env(default, *keys):
 
 BOT_NAME = "ScalpingTPFast"
 MESSAGE_PREFIX = "[TPFAST]"
-BOT_ID = os.getenv("BOT_ID_SCALPING_TPFAST") or f"TPFAST-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+REPORT_BASENAME = os.getenv("TPFAST_REPORT_BASENAME", "trading_report_tpfast")
+DB_PATH = os.getenv("TRADING_DB_PATH", "trading_history.db")
+BOT_ID = os.getenv("BOT_ID_SCALPING_TPFAST") or f"TPFAST-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 if not TOKEN or not CHAT_ID:
@@ -66,21 +71,20 @@ TIMEFRAME_NAMES = {
 client = Client()
 
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "NEARUSDT",
-    "FILUSDT", "ETCUSDT", "OPUSDT", "ARBUSDT", "ATOMUSDT",
-    "HBARUSDT", "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
-    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT", "FLOWUSDT",
-    "EGLDUSDT", "AXSUSDT", "IMXUSDT", "SANDUSDT", "MANAUSDT",
-    "ENJUSDT", "APEUSDT", "QNTUSDT", "DASHUSDT", "COMPUSDT",
-    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
-    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
-    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT", "ZILUSDT",
-    "RVNUSDT", "SSVUSDT", "ALGOUSDT", "CELOUSDT", "YFIUSDT",
-    "BAKEUSDT", "GTCUSDT", "HIGHUSDT", "IOSTUSDT", "KNCUSDT",
-    "LRCUSDT", "MTLUSDT", "OGNUSDT", "ONTUSDT", "STORJUSDT",
+    "1INCHUSDT", "APTUSDT", "AXSUSDT", "CAKEUSDT", "DOGEUSDT", "ETCUSDT",
+    "FLOWUSDT", "HBARUSDT", "KNCUSDT", "LTCUSDT", "OPUSDT", "RUNEUSDT",
+    "SOLUSDT", "THETAUSDT", "UNIUSDT", "ZILUSDT", "ACTUSDT", "ALICEUSDT",
+    "APEUSDT", "ARUSDT", "AUSDT", "BABYUSDT", "BARDUSDT", "BERAUSDT",
+    "BOMEUSDT", "CFXUSDT", "COTIUSDT", "DASHUSDT", "DYMUSDT", "ENAUSDT",
+    "FORMUSDT", "GPSUSDT", "HUMAUSDT", "INITUSDT", "JTOUSDT", "KERNELUSDT",
+    "LISTAUSDT", "MANTAUSDT", "MEMEUSDT", "MOVEUSDT", "NEWTUSDT", "NXPCUSDT",
+    "ONEUSDT", "PAXGUSDT", "PHBUSDT", "POLUSDT", "RESOLVUSDT", "RSRUSDT",
+    "SFPUSDT", "SKYUSDT", "STGUSDT", "SUNUSDT", "SYRUPUSDT", "TRBUSDT",
+    "TURBOUSDT", "USDCUSDT", "VIRTUALUSDT", "WLFIUSDT", "XLMUSDT", "XVSUSDT",
+    "ZROUSDT", "ZRXUSDT",
 ]
+
+
 
 # ===== PRESET SCALPING_TPFAST =====
 ATR_PERIOD = 14
@@ -104,7 +108,7 @@ MIN_ATR_PCT = 0.0010          # 0.10%
 MAX_ATR_PCT = 0.035           # 3.5%
 SL_ATR_MULT = _float_env(1.3, "SCALPING_TPFAST_SL_ATR_MULT", "SCALPING_SL_ATR_MULT")
 TP_ATR_MULT = _float_env(2.1, "SCALPING_TPFAST_TP_ATR_MULT", "SCALPING_TP_ATR_MULT")  # ATR base más cercano
-TP_DISTANCE_MULTIPLIERS = [0.9, 0.6, 0.4]
+TP_DISTANCE_MULTIPLIERS = [0.6, 0.9, 1.3]
 
 # Confluencias rápidas (opcionales en score; no gate)
 USE_FIB = True
@@ -130,79 +134,143 @@ MIN_BODY_TO_RANGE = 0.45
 MAX_UPWICK_FOR_LONG  = 0.50
 MAX_DOWNWICK_FOR_SHORT = 0.50
 
-# Alineación intra-día (opcional)
-TIMEFRAME_ALIGNMENT = True
-ALIGN_WITH = ["15m", "30m"]
+# Alineación y sesgos adicionales
+TIMEFRAME_ALIGNMENT = os.getenv("TPFAST_TIMEFRAME_ALIGNMENT", "True").lower() == "true"
+ALIGN_WITH = [tf.strip() for tf in os.getenv("TPFAST_ALIGN_WITH", "15m,30m").split(",") if tf.strip()]
+USE_FUNDING_BIAS = os.getenv("TPFAST_USE_FUNDING_BIAS", "True").lower() == "true"
+MAX_POSITIVE_FUNDING = _float_env(0.05, "TPFAST_MAX_POSITIVE_FUNDING", "MAX_POSITIVE_FUNDING")
+MIN_NEGATIVE_FUNDING = _float_env(-0.05, "TPFAST_MIN_NEGATIVE_FUNDING", "MIN_NEGATIVE_FUNDING")
 
-# Funding
-USE_FUNDING_BIAS = True
-MAX_POSITIVE_FUNDING = 0.06
-MIN_NEGATIVE_FUNDING = -0.06
-
-# Score (ahora sí se usa)
-USE_SIGNAL_SCORE = True
+# Score de señal
+USE_SIGNAL_SCORE = os.getenv("TPFAST_USE_SIGNAL_SCORE", "True").lower() == "true"
 SCORE_WEIGHTS = {
-    "trend_EMA200": 1.6,
+    "trend_EMA200": 1.5,
     "ema_distance": 1.0,
     "fib_confluence": 1.2,
-    "rsi_zone": 0.9,
+    "rsi_zone": 0.8,
     "volume_ratio": 1.2,
-    "atr_in_range": 1.0,
-    "adx": 0.8,
+    "atr_in_range": 0.9,
+    "adx": 0.7,
     "tf_alignment": 0.8,
 }
-MIN_SCORE_TO_TRADE = 3.6
+MIN_SCORE_TO_TRADE = _float_env(3.4, "TPFAST_MIN_SCORE", "MIN_SCORE_TO_TRADE")
 
-# Gestión / Frecuencia
-MAX_CONCURRENT_POS = 3
-COOLDOWN_AFTER_TRADE_MIN = 10
-MAX_TRADES_PER_DAY = 20
-POSITION_SIZE_MULT = 0.8
-LEVERAGE_CAP = 5
-PYRAMIDING = False
-PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
+# Gestión de riesgo y frecuencia
+MAX_CONCURRENT_POS = int(os.getenv("TPFAST_MAX_CONCURRENT_POS", os.getenv("MAX_CONCURRENT_POS", "3")))
+COOLDOWN_AFTER_TRADE_MIN = int(os.getenv("TPFAST_COOLDOWN_MIN", "5"))
+MAX_TRADES_PER_DAY = int(os.getenv("TPFAST_MAX_TRADES_PER_DAY", "30"))
+RISK_USD_PER_TRADE = _float_env(7.5, "RISK_USD_SCALPING_TPFAST", "RISK_USD_SCALPING", "RISK_USD_GLOBAL", "RISK_AMOUNT_USD")
 
-# Escaneo cada 3 minutos (ideal para 5m)
-SCAN_INTERVAL_SECONDS = 180
+# Escaneo y reportes
+SCAN_INTERVAL_SECONDS = int(os.getenv("TPFAST_SCAN_INTERVAL_SECONDS", "180"))
+STARTUP_JITTER_RANGE = (
+    _float_env(2.0, "TPFAST_STARTUP_JITTER_MIN", "STARTUP_JITTER_MIN", "JITTER_MIN"),
+    _float_env(5.0, "TPFAST_STARTUP_JITTER_MAX", "STARTUP_JITTER_MAX", "JITTER_MAX"),
+)
 
-# Ruta de base de datos y base de reportes
-DB_PATH = "trading_history.db"
-REPORT_BASENAME = "trading_report_tpfast"
+# Trailing stop configuration
+TRAILING_MODE = (os.getenv("TPFAST_TRAILING_MODE", os.getenv("TRAILING_MODE_DEFAULT", "tp_lock")) or "tp_lock").strip().lower()
+TRAILING_FROM_TP = int(os.getenv("TPFAST_TRAILING_FROM_TP", os.getenv("TRAILING_FROM_TP", "1")))
+TRAILING_DYNAMIC_METHOD = (os.getenv("TPFAST_TRAILING_METHOD", os.getenv("TRAILING_METHOD_DEFAULT", "atr")) or "atr").strip().lower()
+TRAILING_ATR_PERIOD = int(os.getenv("TPFAST_TRAILING_ATR_PERIOD", os.getenv("TRAILING_ATR_PERIOD", "14")))
+TRAILING_ATR_MULT = _float_env(1.1, "TPFAST_TRAILING_ATR_MULT", "TRAILING_ATR_MULT")
+TRAILING_EMA_PERIOD = int(os.getenv("TPFAST_TRAILING_EMA_PERIOD", os.getenv("TRAILING_EMA_PERIOD", "34")))
+TRAILING_SWING_LOOKBACK = int(os.getenv("TPFAST_TRAILING_SWING_LOOKBACK", os.getenv("TRAILING_SWING_LOOKBACK", "5")))
+TRAILING_MIN_IMPROVEMENT_PCT = _float_env(0.0004, "TPFAST_TRAILING_MIN_IMPROVEMENT_PCT", "TRAILING_MIN_IMPROVEMENT_PCT")
+TRAILING_BE_BUFFER_PCT = _float_env(0.0, "TPFAST_BREAK_EVEN_BUFFER", "TRAILING_BREAK_EVEN_BUFFER")
+TRAILING_LOCK_BUFFER_PCT = _float_env(0.0, "TPFAST_TRAILING_LOCK_BUFFER", "TRAILING_LOCK_BUFFER")
+TRAILING_GUARD_TICKS = int(os.getenv("TPFAST_TRAILING_GUARD_TICKS", os.getenv("TRAILING_GUARD_TICKS", "2")))
+TRAILING_TIMEFRAME = os.getenv("TPFAST_TRAILING_TIMEFRAME", "5m")
+TRAILING_NOTIFY = os.getenv("TPFAST_TRAILING_NOTIFY", "True").lower() == "true"
 
 # Estado runtime
-_last_trade_time = {}
-_daily_trade_count = {}  # {YYYY-MM-DD: {"detected": int, "approved": int, "executed": int}}
+_last_trade_time: dict[str, float] = {}
+_daily_trade_count: dict[str, dict] = {}
 
-# ====== INIT componentes externos ======
+# Inicializar servicios
 db = TradingDatabase(DB_PATH)
 trader = None
 auto_closer = None
+trailing_manager = None
+trade_monitor = None
+
 if AUTO_TRADE_ENABLED:
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context=BOT_NAME)
         print("✅ Trader de Binance Futures inicializado")
+
         try:
             auto_closer = AutoCloser(trader, db, bot_name=BOT_NAME)
             auto_closer.start()
-        except Exception as e:
-            print(f"⚠️ AutoCloser no pudo iniciar: {e}")
-    except Exception as e:
-        print(f"❌ Error al inicializar trader: {e}")
+        except Exception as auto_err:
+            auto_closer = None
+            print(f"⚠️ AutoCloser no pudo iniciar: {auto_err}")
+
+        try:
+            trailing_config = TrailingConfig(
+                mode=TRAILING_MODE,
+                start_tp=max(1, TRAILING_FROM_TP),
+                dynamic_method=TRAILING_DYNAMIC_METHOD,
+                atr_period=TRAILING_ATR_PERIOD,
+                atr_mult=TRAILING_ATR_MULT,
+                ema_period=TRAILING_EMA_PERIOD,
+                swing_lookback=TRAILING_SWING_LOOKBACK,
+                min_improvement_pct=TRAILING_MIN_IMPROVEMENT_PCT,
+                break_even_buffer_pct=TRAILING_BE_BUFFER_PCT,
+                lock_tp_buffer_pct=TRAILING_LOCK_BUFFER_PCT,
+                guard_ticks=TRAILING_GUARD_TICKS,
+                timeframe_fallback=TRAILING_TIMEFRAME,
+                allow_notifications=TRAILING_NOTIFY,
+            )
+            trailing_manager = TrailingStopManager(
+                trader=trader,
+                db=db,
+                bot_name=BOT_NAME,
+                config=trailing_config,
+                notify_func=None,
+            )
+        except Exception as trailing_err:
+            trailing_manager = None
+            print(f"⚠️ TrailingStopManager no pudo iniciar: {trailing_err}")
+
+        try:
+            trade_monitor = TradeMonitor(trader, db, bot_name=BOT_NAME, trailing_manager=trailing_manager)
+            trade_monitor.start()
+        except Exception as monitor_err:
+            trade_monitor = None
+            print(f"⚠️ TradeMonitor no pudo iniciar: {monitor_err}")
+
+        if hasattr(trader, "reconciler") and trader.reconciler:
+            try:
+                daemon_interval = int(os.getenv("PROTECTION_DAEMON_INTERVAL", "45"))
+                trader.reconciler.start_protection_daemon(db, interval=daemon_interval, bot_name=BOT_NAME)
+            except Exception as daemon_err:
+                print(f"⚠️ Protection daemon no pudo iniciar: {daemon_err}")
+    except Exception as init_err:
+        print(f"❌ Error al inicializar trader: {init_err}")
         print("⚠️ El bot funcionará solo en modo alerta (sin trading)")
         AUTO_TRADE_ENABLED = False
 
-# ================== UTILIDADES ==================
+
+from notifier import send_telegram as _notifier_send
+
+
 def send_telegram(message: str):
+    # Preserve per-bot prefixing, then delegate to shared notifier
     if not message.startswith(MESSAGE_PREFIX):
         message = f"{MESSAGE_PREFIX} {message}"
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
+        return _notifier_send(message)
     except Exception as e:
-        print(f"[WARN] Telegram falló: {e}")
+        print(f"[WARN] notifier.send_telegram falló: {e}")
+        return False
+
+
+if TRAILING_NOTIFY and trailing_manager:
+    try:
+        trailing_manager.notify = send_telegram
+    except Exception:
+        pass
 
 def decimals_for(symbol: str) -> int:
     if symbol.endswith("USDT"): return 5
@@ -506,95 +574,47 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             print(f"⏳ Cooldown activo para {key}, omitiendo...")
             return False
 
-        day = datetime.utcnow().strftime("%Y-%m-%d")
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         day_stats = _daily_trade_count.get(day, {"approved": 0, "executed": 0, "detected": 0})
         if day_stats.get("executed", 0) >= MAX_TRADES_PER_DAY:
             print(f"⛔ Límite diario de ejecuciones alcanzado ({MAX_TRADES_PER_DAY}).")
             return False
 
-        open_positions = trader.get_open_positions()
-        if any(pos.get('symbol') == symbol for pos in open_positions):
-            print(f"⚠️ Ya existe una posición abierta en {symbol}, omitiendo...")
-            return False
         max_conc = min(MAX_CONCURRENT_POS, MAX_POSITIONS)
-        if len(open_positions) >= max_conc:
-            print(f"⚠️ Máximo de posiciones alcanzado ({max_conc}), omitiendo...")
-            return False
-
-        result = trader.open_position(
+        execution = trader.execute_protected_entry(
             symbol=symbol,
             side=side,
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
-            force_market=USE_MARKET_ORDER
+            db=db,
+            bot_name=BOT_NAME,
+            bot_id=BOT_ID,
+            timeframe=timeframe,
+            notes=f"Señal {BOT_NAME} - {timeframe}",
+            force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE,
+            context="auto_trading_scanner_scalping_tpfast",
+            max_positions=max_conc
         )
-        if result:
-            trade_id = db.add_trade(
-                symbol=symbol,
-                side=side,
-                entry_price=result['entry_price'],
-                quantity=result['quantity'],
-                leverage=result['leverage'],
-                sl_price=result['sl_price'],
-                tp_prices=result['tp_prices'],
-                timeframe=timeframe,
-                notes=f"Señal {BOT_NAME} - {timeframe}",
-                bot=BOT_NAME,
-                bot_id=BOT_ID,
-                entry_order_id=result.get('entry_order_id'),
-                entry_client_order_id=result.get('entry_client_order_id'),
-                position_id=result.get('position_id'),
-                margin_balance_entry=result.get('margin_before'),
-                margin_balance_post_entry=result.get('margin_after'),
-                margin_used=result.get('margin_used'),
-                isolated_margin=result.get('isolated_margin')
-            )
-            # Guardar orden de entrada con precio promedio si existe
-            entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
-            try:
-                entry_price_record = float(entry_price_record)
-            except Exception:
-                entry_price_record = result['entry_price']
-            db.add_order(
-                trade_id=trade_id,
-                order_id=str(result['entry_order']['orderId']),
-                order_type="ENTRY",
-                side=result['entry_order']['side'],
-                symbol=symbol,
-                price=entry_price_record,
-                quantity=result['quantity'],
-                status=result['entry_order'].get("status","NEW"),
-                client_order_id=result['entry_order'].get('clientOrderId'),
-                position_id=result.get('position_id')
-            )
-            if result.get('sl_order'):
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['sl_order']['orderId']),
-                    order_type="STOP_LOSS",
-                    side=result['sl_order']['side'],
-                    symbol=symbol,
-                    price=result['sl_price'],
-                    quantity=result['quantity'],
-                    status=result['sl_order'].get("status","NEW"),
-                    client_order_id=result['sl_order'].get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
-            for i, tp_order in enumerate(result.get('tp_orders', []), 1):
-                tp_price = tp_order.get('stopPrice') or tp_order.get('price') or (result['tp_prices'][i-1] if i-1 < len(result['tp_prices']) else None)
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(tp_order['orderId']),
-                    order_type=f"TAKE_PROFIT_{i}",
-                    side=tp_order['side'],
-                    symbol=symbol,
-                    price=tp_price,
-                    quantity=result['quantity'],
-                    status=tp_order.get("status","NEW"),
-                    client_order_id=tp_order.get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
+        if execution:
+            trade_id = execution['trade_id']
+            if trade_monitor:
+                try:
+                    trade_monitor.register_trade(symbol, trade_id)
+                except Exception as tm_err:
+                    print(f"⚠️ TradeMonitor no pudo registrar {symbol}: {tm_err}")
+            if hasattr(trader, 'reconciler') and trader.reconciler:
+                enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+                if enable_monitoring:
+                    monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
+                    monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
+                    trader.reconciler.start_monitoring(
+                        symbol=symbol,
+                        trade_id=trade_id,
+                        duration_seconds=monitor_duration,
+                        check_interval=monitor_interval
+                    )
             day_stats["executed"] = day_stats.get("executed", 0) + 1
             _daily_trade_count[day] = day_stats
             _last_trade_time[key] = now
@@ -608,7 +628,7 @@ def run_scan_once():
     print("\n" + "="*60)
     print("⚡ ESCANEO SCALPING_TPFAST")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
-    print(datetime.utcnow().strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
+    print(datetime.now(timezone.utc).strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
     print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
     print("="*60)
     print(f"🛡️ Filtros activos ({BOT_NAME}):")
@@ -619,7 +639,7 @@ def run_scan_once():
     print("="*60)
 
     # control diario
-    day = datetime.utcnow().strftime("%Y-%m-%d")
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     day_stats = _daily_trade_count.get(day, {"approved":0, "executed":0, "detected":0})
     summary = {"detected": 0, "approved": 0, "rejected": 0, "executed": 0}
     rejection_reasons: Counter[str] = Counter()
@@ -805,8 +825,16 @@ def main():
 ⏰ TFs: {', '.join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES)}
 🔄 Escaneo cada {minutes} min
 🛡️ Score mínimo {MIN_SCORE_TO_TRADE} | Alineación TF: {TIMEFRAME_ALIGNMENT} | Funding: {USE_FUNDING_BIAS}
-🗃️ DB: {DB_PATH}
+ �️ Trailing SL: { (trailing_manager.config.mode if (trailing_manager and trailing_manager.config and trailing_manager.config.mode not in ('off','none')) else 'OFF').upper() } desde TP{ (trailing_manager.config.start_tp if trailing_manager and trailing_manager.config else 1) }
+�🗃️ DB: {DB_PATH}
 📁 Reporte: reports/{REPORT_BASENAME}.png""")
+
+    jitter_min, jitter_max = STARTUP_JITTER_RANGE
+    if jitter_max < jitter_min:
+        jitter_min, jitter_max = jitter_max, jitter_min
+    jitter_delay = random.uniform(jitter_min, jitter_max)
+    print(f"⏳ Jitter inicial: esperando {jitter_delay:.2f}s antes del primer escaneo")
+    time.sleep(jitter_delay)
 
     while True:
         try:
@@ -817,6 +845,11 @@ def main():
             try:
                 if auto_closer:
                     auto_closer.stop()
+            except Exception:
+                pass
+            try:
+                if trade_monitor:
+                    trade_monitor.stop()
             except Exception:
                 pass
             send_telegram(f"⚠️ {BOT_NAME} detenido")

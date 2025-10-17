@@ -15,13 +15,20 @@ Uso:
 import os
 import time
 import threading
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 from datetime import datetime
 from binance.exceptions import BinanceAPIException
 
 
 class TradeMonitor:
-    def __init__(self, trader, db, bot_name: Optional[str] = None):
+    def __init__(
+        self,
+        trader,
+        db,
+        bot_name: Optional[str] = None,
+        trailing_manager: Optional[object] = None,
+        tp_callback: Optional[Callable[[int, int, Optional[float]], None]] = None,
+    ):
         """
         Args:
             trader: Instancia de BinanceFuturesTrader
@@ -32,6 +39,8 @@ class TradeMonitor:
         self.db = db
         self.bot_name = bot_name
         self.client = trader.client
+        self.trailing_manager = trailing_manager
+        self._tp_callback = tp_callback
         
         # Configuración
         self.enabled = os.getenv("TRADE_MONITOR_ENABLED", "True").lower() == "true"
@@ -93,7 +102,11 @@ class TradeMonitor:
                 'tp_prices': trade.get('tp_prices', []),
                 'registered_at': datetime.now(),
                 'last_exit_order_id': None,
-                'last_exit_client_id': None
+                'last_exit_client_id': None,
+                'tp_hits': set(),
+                'timeframe': trade.get('timeframe'),
+                'position_id': trade.get('position_id'),
+                'symbol': symbol
             }
             
             print(f"✅ TradeMonitor: Registrado {symbol} (ID: {trade_id})")
@@ -120,7 +133,11 @@ class TradeMonitor:
                     'tp_prices': trade.get('tp_prices', []),
                     'registered_at': datetime.now(),
                     'last_exit_order_id': None,
-                    'last_exit_client_id': None
+                    'last_exit_client_id': None,
+                    'tp_hits': set(),
+                    'timeframe': trade.get('timeframe'),
+                    'position_id': trade.get('position_id'),
+                    'symbol': symbol
                 }
             
             if self._tracked_positions:
@@ -181,6 +198,20 @@ class TradeMonitor:
                             exit_client_order_id=tracked.get('last_exit_client_id'),
                             margin_balance_exit=margin_exit
                         )
+
+                        try:
+                            self.db.log_trade_event(
+                                trade_id=tracked['trade_id'],
+                                event_type="TRADE_CLOSED",
+                                payload={
+                                    "symbol": symbol,
+                                    "exit_price": exit_price,
+                                    "exit_reason": exit_reason,
+                                    "margin_balance_exit": margin_exit
+                                }
+                            )
+                        except Exception:
+                            pass
                         
                         print(f"✅ TradeMonitor: Trade cerrado - {symbol} @ {exit_price:.6f} ({exit_reason})")
                         
@@ -252,16 +283,37 @@ class TradeMonitor:
                                         tracked['last_exit_order_id'] = order_id
                                         tracked['last_exit_client_id'] = order.get('clientOrderId')
 
-                                    # Actualizar órdenes procesadas
-                                    self._processed_orders.add(order_id)
-
-                                    # Determinar tipo de salida
+                                    # Determinar tipo de salida antes de loguear
                                     if 'STOP' in order_type and 'TAKE_PROFIT' not in order_type:
                                         exit_type = "STOP_LOSS"
                                     else:
                                         exit_type = "TAKE_PROFIT"
 
+                                    try:
+                                        self.db.log_trade_event(
+                                            trade_id=tracked['trade_id'] if tracked else None,
+                                            event_type="ORDER_FILLED",
+                                            payload={
+                                                "symbol": symbol,
+                                                "order_id": order_id,
+                                                "order_type": exit_type,
+                                                "price": avg_price,
+                                                "quantity": executed_qty,
+                                                "update_time": filled_ts
+                                            }
+                                        )
+                                    except Exception:
+                                        pass
+
+                                    # Actualizar órdenes procesadas
+                                    self._processed_orders.add(order_id)
+
                                     print(f"🔔 TradeMonitor: {exit_type} ejecutado - {symbol} @ {avg_price:.6f} | qty={executed_qty}")
+                                    if exit_type == "TAKE_PROFIT" and tracked is not None and self.trailing_manager:
+                                        try:
+                                            self._handle_take_profit(symbol, tracked, order, avg_price, executed_qty)
+                                        except Exception as trailing_exc:
+                                            print(f"⚠️ TradeMonitor: error aplicando trailing para {symbol}: {trailing_exc}")
                     
                     # Limpiar cache de órdenes (mantener solo últimas 1000)
                     if len(self._processed_orders) > 1000:
@@ -278,6 +330,147 @@ class TradeMonitor:
         except Exception as e:
             print(f"❌ TradeMonitor: Error verificando órdenes: {e}")
     
+    def _handle_take_profit(self, symbol: str, tracked: Dict, order: Dict, avg_price: float, executed_qty: float) -> None:
+        order_id = str(order.get('orderId')) if order.get('orderId') is not None else None
+        tp_index = None
+
+        if order_id:
+            try:
+                order_row = self.db.get_order_by_id(order_id)
+            except Exception:
+                order_row = None
+            if order_row:
+                order_type = str(order_row.get('order_type') or '')
+                if order_type.upper().startswith('TAKE_PROFIT'):
+                    try:
+                        tp_index = int(order_type.split('_')[-1])
+                    except (ValueError, IndexError):
+                        tp_index = None
+
+        if tp_index is None:
+            tp_index = self._infer_tp_index(tracked, avg_price)
+
+        if tp_index is None:
+            return
+
+        hits: Set[int] = tracked.setdefault('tp_hits', set())
+        if tp_index in hits:
+            return
+
+        new_sl = self.trailing_manager.on_take_profit(
+            symbol=symbol,
+            tracked=tracked,
+            tp_index=tp_index,
+            fill_price=avg_price,
+            executed_qty=executed_qty,
+            order_id=order_id,
+        )
+
+        if new_sl is not None:
+            previous_sl = tracked.get('sl_price')
+            hits.add(tp_index)
+            tracked['sl_price'] = new_sl
+            try:
+                self.db.log_sl_update(
+                    trade_id=tracked['trade_id'],
+                    old_sl=previous_sl,
+                    new_sl=new_sl,
+                    trigger=f"TP{tp_index}",
+                    order_id=order_id,
+                    extra={
+                        "symbol": symbol,
+                        "fill_price": avg_price,
+                        "executed_qty": executed_qty
+                    }
+                )
+            except Exception:
+                pass
+        else:
+            hits.add(tp_index)
+
+        if self._tp_callback:
+            try:
+                self._tp_callback(tracked['trade_id'], tp_index, new_sl)
+            except Exception as callback_exc:
+                print(f"⚠️ TradeMonitor: error en callback TP: {callback_exc}")
+
+        # Si este TP es el último, intentamos cerrar cualquier remanente inmediatamente
+        tp_prices = tracked.get('tp_prices') or []
+        try:
+            total_tps = len(tp_prices)
+        except Exception:
+            total_tps = 0
+        if total_tps > 0 and tp_index == total_tps:
+            try:
+                # Verificar cantidad abierta actual
+                positions = self.client.futures_position_information(symbol=symbol)
+                qty_open = 0.0
+                side = (tracked.get('side') or 'LONG').upper()
+                for pos in positions:
+                    if pos.get('symbol') == symbol:
+                        try:
+                            qty_open = abs(float(pos.get('positionAmt') or 0))
+                        except Exception:
+                            qty_open = 0.0
+                        break
+                # Si hay remanente, cerrar con reduceOnly
+                if qty_open > 0:
+                    # Validar notional mínima para evitar rechazos
+                    try:
+                        last_price = float(self.client.futures_symbol_ticker(symbol=symbol).get('price'))
+                    except Exception:
+                        last_price = avg_price or float(tracked.get('entry_price') or 0)
+                    min_notional = float(os.getenv('AUTO_CLOSER_MIN_NOTIONAL', '5.0'))
+                    if last_price > 0 and qty_open * last_price >= min_notional:
+                        mkt_side = 'SELL' if side == 'LONG' else 'BUY'
+                        try:
+                            self.client.futures_create_order(
+                                symbol=symbol,
+                                side=mkt_side,
+                                type='MARKET',
+                                quantity=qty_open,
+                                reduceOnly=True
+                            )
+                            try:
+                                self.db.log_trade_event(
+                                    trade_id=tracked['trade_id'],
+                                    event_type="EMERGENCY_FLATTEN",
+                                    payload={
+                                        "symbol": symbol,
+                                        "quantity": qty_open,
+                                        "side": mkt_side
+                                    }
+                                )
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"⚠️ TradeMonitor: No se pudo cerrar remanente en último TP {symbol}: {e}")
+                    # Cancelar órdenes pendientes (SL/TP restantes)
+                    try:
+                        self.trader.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"⚠️ TradeMonitor: error al cerrar remanente tras último TP en {symbol}: {e}")
+
+    def _infer_tp_index(self, tracked: Dict, fill_price: float) -> Optional[int]:
+        tp_prices = tracked.get('tp_prices') or []
+        if not tp_prices:
+            return None
+        try:
+            fill_price = float(fill_price)
+        except Exception:
+            return None
+
+        diffs = [abs(fill_price - float(tp)) for tp in tp_prices]
+        if not diffs:
+            return None
+        best_idx = min(range(len(diffs)), key=lambda i: diffs[i])
+        tolerance = float(tracked.get('entry_price', 0)) * 0.003  # 0.3% tolerance
+        if diffs[best_idx] > tolerance:
+            return None
+        return best_idx + 1
+
     def _get_exit_price(self, symbol: str, tracked: Dict) -> float:
         """Obtiene el precio de salida más preciso posible"""
         try:

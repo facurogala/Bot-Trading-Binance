@@ -13,7 +13,7 @@ Requisitos de entorno (.env):
 
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from functools import lru_cache
@@ -227,15 +227,15 @@ def impulse_tf_allowed(symbol: Optional[str], timeframe: str) -> bool:
 
 
 # ================== UTILIDADES ==================
+from notifier import send_telegram as _notifier_send
+
+
 def send_telegram(message: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
+        return _notifier_send(message)
     except Exception as e:
-        print(f"[WARN] Telegram falló: {e}")
+        print(f"[WARN] notifier.send_telegram falló: {e}")
+        return False
 
 
 def html_escape(s: str) -> str:
@@ -474,101 +474,47 @@ def ichimoku_components(df: pd.DataFrame,
     def mid(hh, ll):
         return (hh + ll) / 2.0
 
-    tenkan_hi = h.rolling(tenkan).max()
-    tenkan_lo = l.rolling(tenkan).min()
-    tenkan_sen = mid(tenkan_hi, tenkan_lo)
+        execution = trader.execute_protected_entry(
+            symbol=symbol,
+            side=side,
+            entry_price=levels['entry_price'],
+            sl_price=levels['sl_price'],
+            tp_prices=levels['tp_prices'],
+            db=db,
+            bot_name=BOT_NAME,
+            bot_id=BOT_ID,
+            timeframe=timeframe,
+            notes=f"Haack Signal - {timeframe}",
+            force_market=USE_MARKET_ORDER,
+            risk_amount_usd=RISK_USD_PER_TRADE,
+            context="auto_trading_scanner_haack",
+            max_positions=MAX_POSITIONS
+        )
 
-    kijun_hi = h.rolling(kijun).max()
-    kijun_lo = l.rolling(kijun).min()
-    kijun_sen = mid(kijun_hi, kijun_lo)
+        if execution:
+            trade_id = execution['trade_id']
 
-    # A/B desplazadas 26 barras en el gráfico clásico; para filtrar ahora, usamos versión "now" sin shift
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2.0).shift(kijun)  # adelantada
-    senkou_span_b = mid(h.rolling(senkou_b).max(), l.rolling(senkou_b).min()).shift(kijun)
+            if trade_monitor:
+                try:
+                    trade_monitor.register_trade(symbol, trade_id)
+                except Exception as tm_err:
+                    print(f"⚠️ TradeMonitor no pudo registrar {symbol}: {tm_err}")
 
-    chikou_span = c.shift(-kijun)  # precio desplazado 26 a la izquierda en el gráfico tradicional
+            if hasattr(trader, 'reconciler') and trader.reconciler:
+                enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+                if enable_monitoring:
+                    monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
+                    monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
+                    trader.reconciler.start_monitoring(
+                        symbol=symbol,
+                        trade_id=trade_id,
+                        duration_seconds=monitor_duration,
+                        check_interval=monitor_interval
+                    )
 
-    ssa_now = ((tenkan_sen + kijun_sen) / 2.0)  # sin shift, para estado actual
-    ssb_now = mid(h.rolling(senkou_b).max(), l.rolling(senkou_b).min())
-
-    out = {
-        "tenkan": tenkan_sen,
-        "kijun": kijun_sen,
-        "ssa_fwd": senkou_span_a,
-        "ssb_fwd": senkou_span_b,
-        "ssa_now": ssa_now,
-        "ssb_now": ssb_now,
-        "chikou": chikou_span,
-    }
-    return out
-
-
-def ichi_price_vs_kumo(price: float, ssa_now: float, ssb_now: float) -> str:
-    top = max(ssa_now, ssb_now); bot = min(ssa_now, ssb_now)
-    if price > top: return "above"
-    if price < bot: return "below"
-    return "inside"
-
-
-def ichi_signal_strength(side: str, where: str, chikou_ok: bool) -> str:
-    if side == "LONG":
-        if where == "above" and chikou_ok: return "strong"
-        if where == "inside" and chikou_ok: return "medium"
-        if where == "below": return "weak"
-    else:
-        if where == "below" and chikou_ok: return "strong"
-        if where == "inside" and chikou_ok: return "medium"
-        if where == "above": return "weak"
-    return "weak"
-
-
-def ichi_stop(price: float, side: str, kijun: float, ssa_now: float, ssb_now: float, atr: float) -> float:
-    if ICHI_STOP_MODE == "kijun" and pd.notna(kijun):
-        return kijun
-    if ICHI_STOP_MODE == "ssb" and pd.notna(ssa_now) and pd.notna(ssb_now):
-        edge = min(ssa_now, ssb_now) if side == "LONG" else max(ssa_now, ssb_now)
-        return edge
-    # fallback a ATR
-    return price - SL_ATR_MULT * atr if side == "LONG" else price + SL_ATR_MULT * atr
-
-
-# ====== Híbrido: gates + score ======
-def hybrid_gate_and_score(side: str, df: pd.DataFrame, last_row: pd.Series,
-                          ema20_series: pd.Series, ema50_series: pd.Series,
-                          precomputed: dict) -> Tuple[bool, float, dict]:
-    """Gates + score híbrido EMA/RSI/ATR/ADX/Fib/Vol + Ichimoku."""
-    notes = {}
-    price = float(last_row["close"])
-
-    ema20 = float(ema20_series.iloc[-1]); ema50 = float(ema50_series.iloc[-1])
-    ema_distance = abs(ema20 - ema50) / price
-    notes["ema_distance"] = ema_distance
-
-    vol_ratio = precomputed.get("vol_ratio", 1.0)
-    rsi = precomputed.get("rsi", None)
-    atr = precomputed.get("atr", None)
-    atr_pct_now = precomputed.get("atr_pct_now", None)
-    adx_val = precomputed.get("adx", None)
-    fib_conf = precomputed.get("fib_conf", 0.0)
-    sr_conf  = precomputed.get("sr_conf", 0.0)
-    mtaf_ok = precomputed.get("mtaf_ok", True)
-
-    # Ichimoku
-    ichi = ichimoku_components(df)
-    if ichi is None or pd.isna(ichi["ssa_now"].iloc[-1]) or pd.isna(ichi["ssb_now"].iloc[-1]):
-        return False, 0.0, {"reason": "Ichimoku no disponible"}
-
-    where = ichi_price_vs_kumo(price, float(ichi["ssa_now"].iloc[-1]), float(ichi["ssb_now"].iloc[-1]))
-    tk_now_up   = ichi["tenkan"].iloc[-1] > ichi["kijun"].iloc[-1]
-    tk_prev_up  = ichi["tenkan"].iloc[-2] > ichi["kijun"].iloc[-2]
-    tk_cross_lo =  tk_now_up and not tk_prev_up
-    tk_cross_sh = (ichi["tenkan"].iloc[-1] < ichi["kijun"].iloc[-1]) and not (ichi["tenkan"].iloc[-2] < ichi["kijun"].iloc[-2])
-    tk_cross = tk_cross_lo if side=="LONG" else tk_cross_sh
-
-    chik_ok = True
-    if GATE_CHIKOU_CONFIRM:
-        try:
-            chik = float(ichi["chikou"].iloc[-1])
+            _last_trade_time[key] = now
+            _daily_trade_count[day_key] = day_stats + 1
+            return True
             ref  = float(df["close"].iloc[-ICHI_KIJUN]) if len(df) > ICHI_KIJUN else float(df["close"].iloc[0])
             chik_ok = (chik > ref) if side=="LONG" else (chik < ref)
         except Exception:
@@ -965,7 +911,7 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             return None
 
         # Límite diario
-        day = datetime.utcnow().strftime('%Y-%m-%d')
+    day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         cnt = _daily_trade_count.get(day, 0)
         if cnt >= MAX_TRADES_PER_DAY:
             print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
@@ -1299,7 +1245,7 @@ def main():
     auto_closer = None
     if AUTO_TRADE_ENABLED:
         try:
-            trader = BinanceFuturesTrader()
+            trader = BinanceFuturesTrader(context=BOT_NAME)
             # Mostrar datos de cuenta
             balance = trader.get_account_balance()
             print(f"💰 Balance: {balance:.2f} USDT")

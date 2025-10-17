@@ -3,27 +3,60 @@
 ║              REPORTE DE TRADING (CONSOLIDADO)                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-Generado: 2025-10-09 15:02:44
+Generado: 2025-10-16 22:11:01
 
 ESTADÍSTICAS GENERALES - Bot: ScalpingLax
 ============================================================
-Total de Trades:           0
-Trades Ganadores:          0 (0.0%)
-Trades Perdedores:         0 (100.0%)
+Total de Trades:           3
+Trades Ganadores:          2 (66.7%)
+Trades Perdedores:         1 (33.3%)
 
 RENDIMIENTO
 ============================================================
-PnL Total:                 $0.00
-Promedio Ganancia:         $0.00
-Promedio Pérdida:          $0.00
-Mejor Trade:               $0.00
-Peor Trade:                $0.00
-Profit Factor:             0.00
+PnL Total:                 $2.28
+Promedio Ganancia:         $6.20
+Promedio Pérdida:          $-10.11
+Mejor Trade:               $10.67
+Peor Trade:                $-10.11
+Profit Factor:             1.23
 
 
 ACTIVIDAD (PROMEDIO 7 DÍAS)
 ============================================================
-Bot ScalpingLax: 0.00 operac./día
+Bot ScalpingLax: 0.60 operac./día
 
 ÚLTIMOS 10 TRADES
 ============================================================
+
+Trade #1:
+  Símbolo:    HEMIUSDT
+  Lado:       SHORT
+  Entrada:    $0.07
+  Salida:     $0.07
+  PnL:        $-10.11 (ROE -5.14% | Price -1.71%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  5m
+  Bot:        ScalpingLax
+  Fecha:      2025-10-12 22:51:41.515144
+
+Trade #2:
+  Símbolo:    IOTAUSDT
+  Lado:       LONG
+  Entrada:    $0.15
+  Salida:     $0.16
+  PnL:        +$1.72 (ROE +7.83% | Price +2.61%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  5m
+  Bot:        ScalpingLax
+  Fecha:      2025-10-12 17:34:29.093135
+
+Trade #3:
+  Símbolo:    SNXUSDT
+  Lado:       SHORT
+  Entrada:    $1.00
+  Salida:     $0.96
+  PnL:        +$10.67 (ROE +10.56% | Price +3.52%)
+  Razón:      TAKE_PROFIT_3
+  Timeframe:  5m
+  Bot:        ScalpingLax
+  Fecha:      2025-10-11 16:18:43.232015

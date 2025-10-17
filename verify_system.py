@@ -76,7 +76,7 @@ def check_system():
     print("-" * 80)
     
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="verify_system")
         all_ok &= check_icon(True, "Conexión establecida correctamente", "")
     except Exception as e:
         all_ok &= check_icon(False, "", f"Error de conexión: {e}")

@@ -11,7 +11,7 @@ def main():
     os.environ.setdefault("RISK_PERCENT", "0.3")  # riesgo muy bajo
     load_dotenv(override=False)
 
-    trader = BinanceFuturesTrader()
+    trader = BinanceFuturesTrader(context="tp_adjustment_testnet")
 
     symbol = os.getenv("TP_TEST_SYMBOL", "BTCUSDT")
     side = "SHORT"

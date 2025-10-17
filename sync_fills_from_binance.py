@@ -103,7 +103,7 @@ def main():
     args = parser.parse_args()
 
     db = TradingDatabase('trading_history.db')
-    trader = BinanceFuturesTrader()
+    trader = BinanceFuturesTrader(context="sync_fills_from_binance")
     client = trader.client
 
     total_updates = 0

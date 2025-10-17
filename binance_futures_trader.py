@@ -3,9 +3,15 @@ Módulo de trading automático para Binance Futures
 Maneja la ejecución de órdenes con SL y TP automáticos
 Incluye reconciliación automática de órdenes
 """
+import inspect
+import json
 import os
+import threading
 import time
-from typing import Dict, Optional, List, Tuple
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Optional, List, Tuple, TYPE_CHECKING, Any
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -13,6 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+if TYPE_CHECKING:
+    from trading_database import TradingDatabase
 
 # ========================= Helpers =========================
 def _round_to_step(value: float, step: float) -> float:
@@ -36,11 +44,12 @@ def _round_to_tick(price: float, tick: float) -> float:
 
 
 class BinanceFuturesTrader:
-    def __init__(self):
+    def __init__(self, context: Optional[str] = None):
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET")
         self.testnet = os.getenv("TESTNET", "False").lower() == "true"
         self.reconciler = None  # Se inicializa después del cliente
+        self.context = context or os.getenv("TRADER_CONTEXT")
 
         if not api_key or not api_secret:
             raise ValueError("❌ Error: BINANCE_API_KEY o BINANCE_API_SECRET no están configurados en .env")
@@ -108,7 +117,89 @@ class BinanceFuturesTrader:
             print(f"⚠️ No se pudo inicializar Order Reconciler: {e}")
             self.reconciler = None
 
+        self._setup_order_logging()
+
     # ---------------- Saldo y símbolo ----------------
+    def _setup_order_logging(self) -> None:
+        """Envuelve futures_create_order para dejar trazas en logs/order_events.log."""
+        if os.getenv("ORDER_LOGGING_ENABLED", "True").lower() != "true":
+            return
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+        if getattr(client, "_order_logging_wrapped", False):
+            return
+
+        log_path = Path(os.getenv("ORDER_LOG_PATH", "order_calls.log"))
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"⚠️ No se pudo preparar el directorio de logs ({log_path}): {e}")
+
+        original_create_order = client.futures_create_order
+
+        def _safe_serialize(value):
+            try:
+                json.dumps(value)
+                return value
+            except (TypeError, ValueError):
+                if isinstance(value, dict):
+                    return {k: _safe_serialize(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple, set)):
+                    return [_safe_serialize(v) for v in value]
+                return repr(value)
+
+        def wrapper(*args, **kwargs):
+            timestamp = datetime.now(timezone.utc).isoformat()
+            stack = [
+                {
+                    "file": frame.filename,
+                    "line": frame.lineno,
+                    "function": frame.function,
+                }
+                for frame in inspect.stack()[1:6]
+                if "binance_futures_trader.py" not in frame.filename
+            ]
+
+            payload = {
+                "timestamp": timestamp,
+                "process_id": os.getpid(),
+                "thread_id": threading.get_ident(),
+                "context": self.context,
+                "testnet": self.testnet,
+                "symbol": kwargs.get("symbol"),
+                "side": kwargs.get("side"),
+                "order_type": kwargs.get("type"),
+                "quantity": kwargs.get("quantity"),
+                "price": kwargs.get("price"),
+                "stop_price": kwargs.get("stopPrice"),
+                "reduce_only": kwargs.get("reduceOnly"),
+                "close_position": kwargs.get("closePosition"),
+                "position_side": kwargs.get("positionSide"),
+                "raw_args": _safe_serialize(args),
+                "raw_kwargs": _safe_serialize(kwargs),
+                "call_stack": stack,
+            }
+
+            try:
+                response = original_create_order(*args, **kwargs)
+                payload["status"] = "success"
+                payload["response"] = _safe_serialize(response)
+                return response
+            except Exception as exc:
+                payload["status"] = "error"
+                payload["error"] = repr(exc)
+                payload["error_stack"] = traceback.format_exc()
+                raise
+            finally:
+                try:
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                except Exception as log_exc:
+                    print(f"⚠️ Order logging fallo al escribir en {log_path}: {log_exc}")
+
+        client.futures_create_order = wrapper
+        client._order_logging_wrapped = True
 
     def get_account_balance(self) -> float:
         """Obtiene el balance en USDT (available o wallet total según RISK_ON_AVAILABLE)."""
@@ -170,6 +261,13 @@ class BinanceFuturesTrader:
         except Exception as e:
             print(f"⚠️ _get_symbol_filters error {symbol}: {e}")
         return {"stepSize": 0.001, "minQty": 0.001, "tickSize": 0.01, "minNotional": 5.0}
+
+    def _is_hedge_mode(self) -> bool:
+        """Indica si la cuenta opera en hedge mode."""
+        try:
+            return bool(self.client.futures_position_mode().get('dualSidePosition'))
+        except Exception:
+            return False
 
     # ---------------- Redondeos ----------------
 
@@ -275,7 +373,8 @@ class BinanceFuturesTrader:
         sl_price: float,
         tp_prices: List[float],
         force_market: bool = False,
-        risk_amount_usd: Optional[float] = None
+        risk_amount_usd: Optional[float] = None,
+        tp_allocations: Optional[List[float]] = None
     ) -> Optional[Dict]:
         """
         Abre una posición en Binance Futures con SL y múltiples TPs.
@@ -346,10 +445,7 @@ class BinanceFuturesTrader:
                     raise ValueError(f"TP{i+1} inválido SHORT: stopPrice {p} debe ser < mark {mark}")
 
             # Detectar hedge mode
-            try:
-                hedge = self.client.futures_position_mode()['dualSidePosition']  # True = hedge
-            except Exception:
-                hedge = False
+            hedge = self._is_hedge_mode()
             position_side = "LONG" if is_long else "SHORT"
 
             # ===== Orden de entrada =====
@@ -389,7 +485,13 @@ class BinanceFuturesTrader:
                         except Exception:
                             pass
 
-                    if status != 'FILLED':
+                    executed_qty = 0.0
+                    try:
+                        executed_qty = float(order_info.get('executedQty') or 0)
+                    except Exception:
+                        executed_qty = 0.0
+
+                    if status not in ('FILLED', 'PARTIALLY_FILLED'):
                         print(f"⚠️ Orden de entrada no se llenó en {timeout}s (status={status}). Cancelando orden.")
                         try:
                             self.client.futures_cancel_order(symbol=symbol, orderId=entry_order['orderId'])
@@ -397,7 +499,24 @@ class BinanceFuturesTrader:
                             pass
                         return None
 
-                    actual_entry = float(order_info.get('avgPrice', entry_price_rounded)) if order_info else entry_price_rounded
+                    if status == 'PARTIALLY_FILLED':
+                        if executed_qty <= 0:
+                            print("⚠️ Orden parcialmente llena sin cantidad ejecutada. Cancelando resto.")
+                            try:
+                                self.client.futures_cancel_order(symbol=symbol, orderId=entry_order['orderId'])
+                            except Exception:
+                                pass
+                            return None
+                        print(f"ℹ️ Orden parcialmente llena ({executed_qty}). Cancelando remanente y continuando con cantidad ejecutada.")
+                        try:
+                            self.client.futures_cancel_order(symbol=symbol, orderId=entry_order['orderId'])
+                        except Exception:
+                            pass
+                        quantity = executed_qty
+
+                    if order_info:
+                        entry_order = order_info
+                    actual_entry = float(entry_order.get('avgPrice', entry_price_rounded))
 
                 except Exception as e:
                     print(f"⚠️ Error al esperar fill de la orden de entrada: {e}")
@@ -529,7 +648,8 @@ class BinanceFuturesTrader:
             print(f"{'='*60}")
 
             sl_order = None
-            tp_orders = []
+            tp_orders: List[Dict] = []
+            risk_amount_effective: Optional[float] = None
 
             # ===== STOP LOSS =====
             sl_side = "SELL" if is_long else "BUY"
@@ -563,8 +683,55 @@ class BinanceFuturesTrader:
                 tp_target_count = len(tp_prices_rounded)
                 print(f"\n🎯 Creando {tp_target_count} Take Profit(s)...")
 
-                # qty por TP
-                base_tp_qty = self.round_step_size(quantity / tp_target_count, step_size)
+                allocation_weights: Optional[List[float]] = None
+                if tp_allocations:
+                    try:
+                        sanitized = [max(float(a), 0.0) for a in tp_allocations]
+                    except Exception:
+                        sanitized = []
+                    if sanitized:
+                        if len(sanitized) < tp_target_count:
+                            sanitized.extend([0.0] * (tp_target_count - len(sanitized)))
+                        sanitized = sanitized[:tp_target_count]
+                        total_alloc = sum(sanitized)
+                        if total_alloc > 0:
+                            allocation_weights = [a / total_alloc for a in sanitized]
+
+                qty_plan: List[float] = []
+                if tp_target_count == 1:
+                    qty_plan = [self.round_step_size(quantity, step_size)]
+                else:
+                    for idx in range(tp_target_count - 1):
+                        if allocation_weights:
+                            raw = quantity * allocation_weights[idx]
+                        else:
+                            raw = quantity / tp_target_count
+                        raw = min(raw, quantity - sum(qty_plan))
+                        use_qty = self.round_step_size(raw, step_size)
+                        if use_qty <= 0 and step_size > 0:
+                            use_qty = step_size
+                        remaining_after = quantity - (sum(qty_plan) + use_qty)
+                        if remaining_after < 0:
+                            use_qty = max(use_qty + remaining_after, step_size if step_size > 0 else 0.0)
+                        use_qty = max(use_qty, 0.0)
+                        qty_plan.append(use_qty)
+                    remaining_qty = max(quantity - sum(qty_plan), 0.0)
+                    if allocation_weights and len(allocation_weights) >= tp_target_count:
+                        raw_last = quantity * allocation_weights[tp_target_count - 1]
+                        remaining_qty = max(remaining_qty, raw_last)
+                    last_qty = self.round_step_size(remaining_qty, step_size) if step_size > 0 else remaining_qty
+                    if last_qty <= 0 and step_size > 0:
+                        last_qty = step_size
+                    qty_plan.append(max(last_qty, 0.0))
+
+                # Ajustar excesos por redondeos
+                total_assigned = sum(qty_plan)
+                if total_assigned > quantity and qty_plan:
+                    overflow = total_assigned - quantity
+                    qty_plan[-1] = max(qty_plan[-1] - overflow, step_size if step_size > 0 else 0.0)
+                elif total_assigned < quantity and qty_plan:
+                    qty_plan[-1] += quantity - total_assigned
+
                 tp_side = "SELL" if is_long else "BUY"
                 final_tp_prices: List[float] = []
 
@@ -585,9 +752,9 @@ class BinanceFuturesTrader:
                     if (not is_long) and tp >= current_mark:
                         tp = _round_to_tick(min(current_mark, actual_entry) - tick_size, tick_size)
 
-                    use_qty = base_tp_qty if i < len(tp_prices_rounded) else self.round_step_size(
-                        quantity - base_tp_qty * (len(tp_prices_rounded) - 1), step_size
-                    )
+                    use_qty = qty_plan[i - 1] if i - 1 < len(qty_plan) else 0.0
+                    if use_qty > quantity:
+                        use_qty = quantity
                     if use_qty <= 0:
                         continue
 
@@ -636,6 +803,18 @@ class BinanceFuturesTrader:
             if not sl_order:
                 print("\n⚠️ ATENCIÓN: NO se pudo crear el Stop Loss. La posición está desprotegida.\n")
 
+            if len(tp_orders) == 0:
+                print("⚠️ No se creó ningún Take Profit. Cancelando posición para mantener cobertura.")
+                self._rollback_unprotected_position(
+                    symbol=symbol,
+                    is_long=is_long,
+                    position_side=position_side,
+                    step_size=step_size,
+                    sl_order=sl_order,
+                    tp_orders=tp_orders
+                )
+                return None
+
             # ===== VERIFICACIÓN EN BINANCE =====
             print("\n🔍 Verificando órdenes en Binance...")
             time.sleep(1)
@@ -663,6 +842,40 @@ class BinanceFuturesTrader:
                     print(f"⚠️ Verificados {tp_count}/{len(tp_prices_rounded)} TP")
             except Exception as e:
                 print(f"⚠️ Error al verificar órdenes: {e}")
+
+            verification_ok, sl_found, verified_tp = self._verify_protective_orders(
+                symbol=symbol,
+                require_sl=True,
+                expected_tp=len(tp_orders)
+            )
+
+            if not verification_ok:
+                print(
+                    f"❌ Protección incompleta: SL={'OK' if sl_found else 'NO'} | "
+                    f"TPs={verified_tp}/{len(tp_orders)}. Iniciando rollback de emergencia..."
+                )
+                self._rollback_unprotected_position(
+                    symbol=symbol,
+                    is_long=is_long,
+                    position_side=position_side,
+                    step_size=step_size,
+                    sl_order=sl_order,
+                    tp_orders=tp_orders
+                )
+                return None
+
+            if not sl_order:
+                # No debería alcanzarse gracias a la verificación, pero se cubre por seguridad.
+                print("❌ Stop Loss no disponible. Cancelando posición para evitar exposición.")
+                self._rollback_unprotected_position(
+                    symbol=symbol,
+                    is_long=is_long,
+                    position_side=position_side,
+                    step_size=step_size,
+                    sl_order=sl_order,
+                    tp_orders=tp_orders
+                )
+                return None
 
             result = {
                 'symbol': symbol,
@@ -712,6 +925,390 @@ class BinanceFuturesTrader:
         except Exception as e:
             print(f"❌ Error al abrir posición: {e}")
             return None
+
+    def execute_protected_entry(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        sl_price: float,
+        tp_prices: List[float],
+        db: "TradingDatabase",
+        bot_name: Optional[str] = None,
+        bot_id: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        notes: Optional[str] = None,
+        force_market: bool = False,
+        risk_amount_usd: Optional[float] = None,
+        context: Optional[str] = None,
+        max_positions: Optional[int] = None,
+        tp_allocations: Optional[List[float]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Orquesta una entrada única garantizando SL/TP y registrando auditaría."""
+
+        attempt_meta = {
+            "timeframe": timeframe,
+            "notes": notes,
+            "tp_count": len(tp_prices),
+            "tp_allocations": tp_allocations
+        }
+        attempt_id = db.create_entry_attempt(
+            symbol=symbol,
+            side=side,
+            bot=bot_name,
+            bot_id=bot_id,
+            context=context,
+            metadata=attempt_meta
+        )
+
+        preflight_ok, preflight_reason = self._preflight_entry(symbol=symbol, force_market=force_market, max_positions=max_positions)
+        if not preflight_ok:
+            db.finish_entry_attempt(
+                attempt_id=attempt_id,
+                status="BLOCKED",
+                reason=preflight_reason
+            )
+            return None
+
+        try:
+            result = self.open_position(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                sl_price=sl_price,
+                tp_prices=tp_prices,
+                force_market=force_market,
+                risk_amount_usd=risk_amount_usd,
+                tp_allocations=tp_allocations
+            )
+        except Exception as exc:
+            db.finish_entry_attempt(
+                attempt_id=attempt_id,
+                status="FAILED",
+                reason=str(exc)
+            )
+            return None
+
+        if not result:
+            db.finish_entry_attempt(
+                attempt_id=attempt_id,
+                status="FAILED",
+                reason="open_position_return_none"
+            )
+            return None
+
+        trade_id = db.add_trade(
+            symbol=symbol,
+            side=side,
+            entry_price=result['entry_price'],
+            quantity=result['quantity'],
+            leverage=result['leverage'],
+            sl_price=result['sl_price'],
+            tp_prices=result['tp_prices'],
+            timeframe=timeframe,
+            notes=notes,
+            bot=bot_name,
+            bot_id=bot_id,
+            entry_order_id=result.get('entry_order_id'),
+            entry_client_order_id=result.get('entry_client_order_id'),
+            position_id=result.get('position_id'),
+            margin_balance_entry=result.get('margin_before'),
+            margin_balance_post_entry=result.get('margin_after'),
+            margin_used=result.get('margin_used'),
+            isolated_margin=result.get('isolated_margin')
+        )
+
+        # Registrar órdenes en DB
+        entry_order = result.get('entry_order') or {}
+        entry_price_record = entry_order.get('avgPrice') or result['entry_price']
+        try:
+            entry_price_record = float(entry_price_record)
+        except Exception:
+            entry_price_record = result['entry_price']
+
+        db.add_order(
+            trade_id=trade_id,
+            order_id=str(entry_order.get('orderId')),
+            order_type="ENTRY",
+            side=str(entry_order.get('side') or ('BUY' if side == 'LONG' else 'SELL')),
+            symbol=symbol,
+            price=entry_price_record,
+            quantity=result['quantity'],
+            status=str(entry_order.get('status') or 'FILLED'),
+            client_order_id=entry_order.get('clientOrderId'),
+            position_id=result.get('position_id')
+        )
+
+        sl_order = result.get('sl_order') or {}
+        if sl_order.get('orderId'):
+            db.add_order(
+                trade_id=trade_id,
+                order_id=str(sl_order['orderId']),
+                order_type="STOP_LOSS",
+                side=str(sl_order.get('side') or ('SELL' if side == 'LONG' else 'BUY')),
+                symbol=symbol,
+                price=result['sl_price'],
+                quantity=result['quantity'],
+                status=str(sl_order.get('status') or 'NEW'),
+                client_order_id=sl_order.get('clientOrderId'),
+                position_id=result.get('position_id')
+            )
+
+        for idx, tp_order in enumerate(result.get('tp_orders') or [], 1):
+            tp_price = tp_order.get('stopPrice') or tp_order.get('price')
+            if tp_price is None and idx - 1 < len(result['tp_prices']):
+                tp_price = result['tp_prices'][idx - 1]
+
+            db.add_order(
+                trade_id=trade_id,
+                order_id=str(tp_order.get('orderId')),
+                order_type=f"TAKE_PROFIT_{idx}",
+                side=str(tp_order.get('side') or ('SELL' if side == 'LONG' else 'BUY')),
+                symbol=symbol,
+                price=tp_price,
+                quantity=result['quantity'],
+                status=str(tp_order.get('status') or 'NEW'),
+                client_order_id=tp_order.get('clientOrderId'),
+                position_id=result.get('position_id')
+            )
+
+        db.finish_entry_attempt(
+            attempt_id=attempt_id,
+            status="FILLED",
+            trade_id=trade_id,
+            entry_order_id=result.get('entry_order_id'),
+            metadata={"risk_budget": result.get('risk_budget')}
+        )
+
+        db.log_trade_event(
+            trade_id=trade_id,
+            event_type="ENTRY_CONFIRMED",
+            payload={
+                "symbol": symbol,
+                "side": side,
+                "quantity": result['quantity'],
+                "entry_price": result['entry_price'],
+                "sl_price": result['sl_price'],
+                "tp_prices": result['tp_prices']
+            }
+        )
+
+        return {
+            "trade_id": trade_id,
+            "attempt_id": attempt_id,
+            "order_bundle": result
+        }
+
+    def _preflight_entry(
+        self,
+        symbol: str,
+        force_market: bool,
+        max_positions: Optional[int]
+    ) -> Tuple[bool, Optional[str]]:
+        """Valida que la entrada pueda ejecutarse sin riesgos previos."""
+
+        try:
+            positions = self.get_open_positions()
+        except Exception as exc:
+            return False, f"positions_unavailable: {exc}"
+
+        active_positions = [p for p in positions if abs(float(p.get('quantity', 0))) > 0]
+        for pos in active_positions:
+            if pos.get('symbol') == symbol:
+                return False, "position_already_open"
+
+        if max_positions is not None and len(active_positions) >= max_positions:
+            return False, "max_positions_reached"
+
+        try:
+            open_orders = self.client.futures_get_open_orders(symbol=symbol)
+        except Exception as exc:
+            open_orders = []
+            if not force_market:
+                return False, f"open_orders_unavailable: {exc}"
+
+        for order in open_orders:
+            if order.get('type') in ('LIMIT', 'MARKET') and order.get('status') in ('NEW', 'PARTIALLY_FILLED'):
+                return False, "pending_entry_order_detected"
+
+        return True, None
+
+    def _verify_protective_orders(self, symbol: str, require_sl: bool, expected_tp: int) -> Tuple[bool, bool, int]:
+        """Comprueba que las órdenes SL/TP estén activas tras la entrada."""
+        attempts = int(os.getenv("ORDER_VERIFY_RETRIES", "3"))
+        delay = float(os.getenv("ORDER_VERIFY_DELAY", "1.0"))
+        last_sl = False
+        last_tp = 0
+
+        for _ in range(max(attempts, 1)):
+            try:
+                open_orders = self.client.futures_get_open_orders(symbol=symbol)
+            except Exception as exc:
+                print(f"⚠️ No se pudieron obtener órdenes abiertas para verificación: {exc}")
+                time.sleep(delay)
+                continue
+
+            sl_present = False
+            tp_counter = 0
+            for order in open_orders:
+                otype = order.get('type', '')
+                if 'TAKE_PROFIT' in otype:
+                    tp_counter += 1
+                elif 'STOP' in otype:
+                    if 'TAKE_PROFIT' not in otype:
+                        sl_present = True
+
+            last_sl = sl_present
+            last_tp = tp_counter
+
+            if (not require_sl or sl_present) and (expected_tp == 0 or tp_counter >= expected_tp):
+                return True, sl_present, tp_counter
+
+            time.sleep(delay)
+
+        return False, last_sl, last_tp
+
+    def _rollback_unprotected_position(
+        self,
+        symbol: str,
+        is_long: bool,
+        position_side: str,
+        step_size: float,
+        sl_order: Optional[Dict],
+        tp_orders: List[Dict]
+    ) -> None:
+        """Cancela las órdenes creadas y cierra la posición si falta protección."""
+        try:
+            self._cancel_orders_safe(symbol, sl_order, tp_orders)
+        except Exception as exc:
+            print(f"⚠️ No se pudieron cancelar todas las órdenes durante rollback: {exc}")
+
+        flattened = self._force_flatten_position(
+            symbol=symbol,
+            is_long=is_long,
+            position_side=position_side,
+            step_size=step_size
+        )
+
+        if not flattened:
+            print("⚠️ El cierre de emergencia no confirmó posición plana. Revisar manualmente en Binance.")
+
+    def _cancel_orders_safe(
+        self,
+        symbol: str,
+        sl_order: Optional[Dict],
+        tp_orders: List[Dict]
+    ) -> None:
+        """Cancela órdenes SL/TP específicas si existen, con fallback a cancel_all."""
+        pending_ids: List[str] = []
+        if sl_order and sl_order.get('orderId'):
+            pending_ids.append(str(sl_order['orderId']))
+        for tp in tp_orders:
+            if tp and tp.get('orderId'):
+                pending_ids.append(str(tp['orderId']))
+
+        for oid in pending_ids:
+            try:
+                self.client.futures_cancel_order(symbol=symbol, orderId=oid)
+                time.sleep(0.1)
+            except Exception:
+                pass
+
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=symbol)
+        except Exception:
+            pass
+
+    def _force_flatten_position(
+        self,
+        symbol: str,
+        is_long: bool,
+        position_side: str,
+        step_size: float
+    ) -> bool:
+        """Envía un MARKET reduce-only para cerrar la posición restante."""
+        try:
+            position = self._get_active_position(symbol)
+        except Exception as exc:
+            print(f"⚠️ No se pudo obtener posición activa durante cierre forzado: {exc}")
+            position = None
+
+        if not position:
+            return True
+
+        qty = abs(float(position.get('positionAmt', 0) or 0))
+        if qty <= 0:
+            return True
+
+        qty = self.round_step_size(qty, step_size)
+        if qty <= 0:
+            return True
+
+        close_side = "SELL" if is_long else "BUY"
+
+        order_kwargs = dict(
+            symbol=symbol,
+            side=close_side,
+            type="MARKET",
+            quantity=qty,
+            reduceOnly=True
+        )
+
+        if self._is_hedge_mode():
+            order_kwargs["positionSide"] = position_side
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                self.client.futures_create_order(**order_kwargs)
+                print(f"✅ Posición cerrada de emergencia (qty={qty})")
+                return True
+            except Exception as exc:
+                print(f"❌ Intento {attempt + 1}/{max_attempts} para cierre de emergencia falló: {exc}")
+                time.sleep(1)
+
+        return False
+
+    def _get_active_position(self, symbol: str) -> Optional[Dict]:
+        """Obtiene la posición activa (qty != 0) para el símbolo."""
+        try:
+            positions = self.client.futures_position_information(symbol=symbol)
+        except Exception as exc:
+            print(f"⚠️ No se pudo recuperar información de posición: {exc}")
+            return None
+
+        for pos in positions:
+            try:
+                amt = float(pos.get('positionAmt', 0))
+            except Exception:
+                amt = 0.0
+            if amt != 0.0:
+                return pos
+
+        return None
+
+    def emergency_close_position(self, symbol: str) -> bool:
+        """Permite a otros módulos cerrar posiciones residuales de manera segura."""
+        hedge = self._is_hedge_mode()
+        try:
+            filters = self._get_symbol_filters(symbol)
+            step = filters.get('stepSize', 0.001)
+        except Exception:
+            step = 0.001
+
+        position = self._get_active_position(symbol)
+        if not position:
+            return True
+
+        is_long = float(position.get('positionAmt', 0) or 0) > 0
+        position_side = position.get('positionSide', 'BOTH') if hedge else ('LONG' if is_long else 'SHORT')
+
+        return self._force_flatten_position(
+            symbol=symbol,
+            is_long=is_long,
+            position_side=position_side,
+            step_size=step
+        )
 
     # ---------------- Posiciones / Cierre / Cancelación ----------------
 
@@ -775,11 +1372,22 @@ class BinanceFuturesTrader:
             for pos in positions:
                 if pos['symbol'] == symbol:
                     side = "SELL" if pos['side'] == "LONG" else "BUY"
+                    # Redondear cantidad a LOT_SIZE para evitar -1111
+                    try:
+                        f = self._get_symbol_filters(symbol)
+                        step = f.get('stepSize', 0.0)
+                    except Exception:
+                        step = 0.0
+                    qty = pos['quantity']
+                    try:
+                        qty = self.round_step_size(float(qty), float(step)) if step else float(qty)
+                    except Exception:
+                        qty = pos['quantity']
                     _ = self.client.futures_create_order(
                         symbol=symbol,
                         side=side,
                         type="MARKET",
-                        quantity=pos['quantity']
+                        quantity=qty,
                     )
                     print(f"✅ Posición cerrada: {symbol}")
                     return True
@@ -804,7 +1412,7 @@ class BinanceFuturesTrader:
 if __name__ == "__main__":
     print("🧪 Probando conexión con Binance Futures...\n")
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="binance_futures_trader.__main__")
 
         balance = trader.get_account_balance()
         print(f"\n💰 Balance base para riesgo: {balance:.2f} USDT "

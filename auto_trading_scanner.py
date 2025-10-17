@@ -7,18 +7,19 @@ import time
 import pandas as pd
 import pandas_ta as ta
 from binance.client import Client
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
+from datetime import datetime, timezone
 from trade_monitor import TradeMonitor
 from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 # ================== CONFIG ==================
 load_dotenv()
-TOKEN   = os.getenv("TELEGRAM_TOKEN")
+    print(datetime.now(timezone.utc).strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not TOKEN or not CHAT_ID:
@@ -28,8 +29,8 @@ if not TOKEN or not CHAT_ID:
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))  # Máximo de posiciones simultáneas
-
-BOT_ID = os.getenv("BOT_ID_SCANNER") or f"SCANNER-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+BOT_ID = os.getenv("BOT_ID_SCANNER") or f"SCANNER-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 
 # Timeframes Swing
 TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
@@ -309,7 +310,7 @@ def check_filters(side: str, df: pd.DataFrame, last_row) -> dict:
 trader = None
 if AUTO_TRADE_ENABLED:
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context=BOT_NAME)
         print("✅ Trader de Binance Futures inicializado")
     except Exception as e:
         print(f"❌ Error al inicializar trader: {e}")
@@ -328,6 +329,13 @@ if AUTO_TRADE_ENABLED and trader:
         trade_monitor.start()
     except Exception as e:
         print(f"⚠️ No se pudo inicializar TradeMonitor: {e}")
+
+    if hasattr(trader, 'reconciler') and trader.reconciler:
+        try:
+            daemon_interval = int(os.getenv("PROTECTION_DAEMON_INTERVAL", "45"))
+            trader.reconciler.start_protection_daemon(db, interval=daemon_interval, bot_name="Scanner")
+        except Exception as e:
+            print(f"⚠️ No se pudo iniciar protection daemon: {e}")
 
 # Diccionario para rastrear trades abiertos
 open_trades_registry = {}  # {symbol: trade_id}
@@ -362,16 +370,12 @@ def generar_reportes_automaticos():
         print(f"⚠️ Error al generar reportes: {e}")
 
 def send_telegram(message: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    from notifier import send_telegram as _notifier_send
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code == 200:
-            print(f"✅ Mensaje enviado a Telegram")
-        else:
-            print(f"⚠️ Error Telegram: {r.status_code}")
+        return _notifier_send(message)
     except Exception as e:
-        print(f"[WARN] Telegram falló: {e}")
+        print(f"[WARN] notifier.send_telegram falló: {e}")
+        return False
 
 def decimals_for(symbol: str) -> int:
     if symbol.endswith("USDT"):
@@ -497,131 +501,53 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         return False
     
     try:
-        # Verificar número de posiciones abiertas
-        open_positions = trader.get_open_positions()
-        
-        # Verificar si ya hay una posición en este símbolo
-        for pos in open_positions:
-            if pos['symbol'] == symbol:
-                print(f"⚠️ Ya existe una posición abierta en {symbol}, omitiendo...")
-                return False
-        
-        if len(open_positions) >= MAX_POSITIONS:
-            print(f"⚠️ Máximo de posiciones alcanzado ({MAX_POSITIONS}), omitiendo...")
-            return False
-        
-        # Ejecutar la orden
-        result = trader.open_position(
+        execution = trader.execute_protected_entry(
             symbol=symbol,
             side=side,
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
+            db=db,
+            bot_name="Scanner",
+            bot_id=BOT_ID,
+            timeframe=timeframe,
+            notes=f"Señal EMA - {timeframe}",
             force_market=USE_MARKET_ORDER,
-            risk_amount_usd=RISK_USD_PER_TRADE
+            risk_amount_usd=RISK_USD_PER_TRADE,
+            context="auto_trading_scanner",
+            max_positions=MAX_POSITIONS
         )
-        
-        if result:
-            # Registrar en la base de datos
-            trade_id = db.add_trade(
-                symbol=symbol,
-                side=side,
-                entry_price=result['entry_price'],
-                quantity=result['quantity'],
-                leverage=result['leverage'],
-                sl_price=result['sl_price'],
-                tp_prices=result['tp_prices'],
-                timeframe=timeframe,
-                notes=f"Señal EMA - {timeframe}",
-                bot="Scanner",
-                bot_id=BOT_ID,
-                entry_order_id=result.get('entry_order_id'),
-                entry_client_order_id=result.get('entry_client_order_id'),
-                position_id=result.get('position_id'),
-                margin_balance_entry=result.get('margin_before'),
-                margin_balance_post_entry=result.get('margin_after'),
-                margin_used=result.get('margin_used'),
-                isolated_margin=result.get('isolated_margin')
-            )
-            
-            # Registrar órdenes individuales
-            entry_price_record = result['entry_order'].get('avgPrice', result['entry_price']) if isinstance(result.get('entry_order'), dict) else result['entry_price']
-            try:
-                entry_price_record = float(entry_price_record)
-            except Exception:
-                entry_price_record = result['entry_price']
-            db.add_order(
-                trade_id=trade_id,
-                order_id=str(result['entry_order']['orderId']),
-                order_type="ENTRY",
-                side=result['entry_order']['side'],
-                symbol=symbol,
-                price=entry_price_record,
-                quantity=result['quantity'],
-                status=result['entry_order'].get('status', 'FILLED'),
-                client_order_id=result['entry_order'].get('clientOrderId'),
-                position_id=result.get('position_id')
-            )
-            
-            if result.get('sl_order'):
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['sl_order']['orderId']),
-                    order_type="STOP_LOSS",
-                    side=result['sl_order']['side'],
-                    symbol=symbol,
-                    price=result['sl_price'],
-                    quantity=result['quantity'],
-                    status="NEW",
-                    client_order_id=result['sl_order'].get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
-            
-            for i, tp_order in enumerate(result['tp_orders'], 1):
-                tp_price = tp_order.get('stopPrice') or tp_order.get('price') or (result['tp_prices'][i-1] if i-1 < len(result['tp_prices']) else None)
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(tp_order['orderId']),
-                    order_type=f"TAKE_PROFIT_{i}",
-                    side=tp_order['side'],
-                    symbol=symbol,
-                    price=tp_price,
-                    quantity=result['quantity'],
-                    status="NEW",
-                    client_order_id=tp_order.get('clientOrderId'),
-                    position_id=result.get('position_id')
-                )
-            
-            # Guardar referencia al trade
-            open_trades_registry[symbol] = trade_id
-            
-            # Registrar en el Trade Monitor
-            if trade_monitor:
-                try:
-                    trade_monitor.register_trade(symbol, trade_id)
-                except Exception as e:
-                    print(f"⚠️ Error registrando en TradeMonitor: {e}")
-            
-            # Iniciar monitoreo con el trade_id correcto si el reconciler está disponado
-            if hasattr(trader, 'reconciler') and trader.reconciler:
-                enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
-                if enable_monitoring:
-                    monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
-                    monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
-                    
-                    trader.reconciler.start_monitoring(
-                        symbol=symbol,
-                        trade_id=trade_id,
-                        duration_seconds=monitor_duration,
-                        check_interval=monitor_interval
-                    )
-            
-            print(f"✅ Trade ejecutado y registrado: {symbol} {side} (ID: {trade_id})")
-            return True
-        else:
+
+        if not execution:
             print(f"❌ No se pudo ejecutar el trade en {symbol}")
             return False
-            
+
+        trade_id = execution['trade_id']
+
+        open_trades_registry[symbol] = trade_id
+
+        if trade_monitor:
+            try:
+                trade_monitor.register_trade(symbol, trade_id)
+            except Exception as e:
+                print(f"⚠️ Error registrando en TradeMonitor: {e}")
+
+        if hasattr(trader, 'reconciler') and trader.reconciler:
+            enable_monitoring = os.getenv("ENABLE_ORDER_MONITORING", "True").lower() == "true"
+            if enable_monitoring:
+                monitor_duration = int(os.getenv("ORDER_MONITOR_DURATION", "120"))
+                monitor_interval = int(os.getenv("ORDER_MONITOR_INTERVAL", "15"))
+
+                trader.reconciler.start_monitoring(
+                    symbol=symbol,
+                    trade_id=trade_id,
+                    duration_seconds=monitor_duration,
+                    check_interval=monitor_interval
+                )
+
+        print(f"✅ Trade ejecutado y registrado: {symbol} {side} (ID: {trade_id})")
+        return True
+
     except Exception as e:
         print(f"❌ Error al ejecutar trade: {e}")
         return False

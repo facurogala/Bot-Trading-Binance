@@ -3,27 +3,82 @@
 ║              REPORTE DE TRADING (CONSOLIDADO)                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-Generado: 2025-10-09 15:02:08
+Generado: 2025-10-16 22:09:24
 
 ESTADÍSTICAS GENERALES - Bot: Scalping
 ============================================================
-Total de Trades:           0
-Trades Ganadores:          0 (0.0%)
-Trades Perdedores:         0 (100.0%)
+Total de Trades:           5
+Trades Ganadores:          2 (40.0%)
+Trades Perdedores:         3 (60.0%)
 
 RENDIMIENTO
 ============================================================
-PnL Total:                 $0.00
-Promedio Ganancia:         $0.00
-Promedio Pérdida:          $0.00
-Mejor Trade:               $0.00
-Peor Trade:                $0.00
-Profit Factor:             0.00
+PnL Total:                 $-7.09
+Promedio Ganancia:         $7.12
+Promedio Pérdida:          $-7.11
+Mejor Trade:               $10.74
+Peor Trade:                $-10.06
+Profit Factor:             0.67
 
 
 ACTIVIDAD (PROMEDIO 7 DÍAS)
 ============================================================
-Bot Scalping: 0.00 operac./día
+Bot Scalping: 1.00 operac./día
 
 ÚLTIMOS 10 TRADES
 ============================================================
+
+Trade #1:
+  Símbolo:    SUIUSDT
+  Lado:       LONG
+  Entrada:    $2.80
+  Salida:     $2.84
+  PnL:        +$10.74 (ROE +4.73% | Price +1.58%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  15m
+  Bot:        Scalping
+  Fecha:      2025-10-13 10:30:54.796685
+
+Trade #2:
+  Símbolo:    1000CATUSDT
+  Lado:       LONG
+  Entrada:    $0.01
+  Salida:     $0.01
+  PnL:        $-9.92 (ROE -4.10% | Price -1.37%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  15m
+  Bot:        Scalping
+  Fecha:      2025-10-13 08:24:25.720179
+
+Trade #3:
+  Símbolo:    TWTUSDT
+  Lado:       LONG
+  Entrada:    $1.44
+  Salida:     $1.42
+  PnL:        $-10.06 (ROE -3.93% | Price -1.31%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  15m
+  Bot:        Scalping
+  Fecha:      2025-10-12 23:35:31.107402
+
+Trade #4:
+  Símbolo:    AWEUSDT
+  Lado:       SHORT
+  Entrada:    $0.09
+  Salida:     $0.09
+  PnL:        $-1.35 (ROE -3.95% | Price -1.32%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  30m
+  Bot:        Scalping
+  Fecha:      2025-10-12 13:06:18.291420
+
+Trade #5:
+  Símbolo:    ETCUSDT
+  Lado:       SHORT
+  Entrada:    $19.29
+  Salida:     $19.20
+  PnL:        +$3.49 (ROE +1.44% | Price +0.48%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  1h
+  Bot:        Scalping
+  Fecha:      2025-10-09 21:36:19.858193

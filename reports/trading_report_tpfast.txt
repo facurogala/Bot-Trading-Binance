@@ -3,27 +3,60 @@
 ║              REPORTE DE TRADING (CONSOLIDADO)                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-Generado: 2025-10-09 15:02:10
+Generado: 2025-10-16 22:10:15
 
 ESTADÍSTICAS GENERALES - Bot: ScalpingTPFast
 ============================================================
-Total de Trades:           0
-Trades Ganadores:          0 (0.0%)
-Trades Perdedores:         0 (100.0%)
+Total de Trades:           3
+Trades Ganadores:          3 (100.0%)
+Trades Perdedores:         0 (0.0%)
 
 RENDIMIENTO
 ============================================================
-PnL Total:                 $0.00
-Promedio Ganancia:         $0.00
+PnL Total:                 $19.36
+Promedio Ganancia:         $6.45
 Promedio Pérdida:          $0.00
-Mejor Trade:               $0.00
-Peor Trade:                $0.00
-Profit Factor:             0.00
+Mejor Trade:               $9.19
+Peor Trade:                $1.77
+Profit Factor:             inf
 
 
 ACTIVIDAD (PROMEDIO 7 DÍAS)
 ============================================================
-Bot ScalpingTPFast: 0.00 operac./día
+Bot ScalpingTPFast: 1.00 operac./día
 
 ÚLTIMOS 10 TRADES
 ============================================================
+
+Trade #1:
+  Símbolo:    WLFIUSDT
+  Lado:       LONG
+  Entrada:    $0.15
+  Salida:     $0.15
+  PnL:        +$1.77 (ROE +3.23% | Price +1.08%)
+  Razón:      TAKE_PROFIT_3
+  Timeframe:  5m
+  Bot:        ScalpingTPFast
+  Fecha:      2025-10-13 17:43:20.028422
+
+Trade #2:
+  Símbolo:    AXSUSDT
+  Lado:       LONG
+  Entrada:    $1.69
+  Salida:     $1.73
+  PnL:        +$8.41 (ROE +5.86% | Price +1.95%)
+  Razón:      AUTO_CLOSER_DETECTED
+  Timeframe:  15m
+  Bot:        ScalpingTPFast
+  Fecha:      2025-10-12 17:50:40.960385
+
+Trade #3:
+  Símbolo:    HBARUSDT
+  Lado:       LONG
+  Entrada:    $0.18
+  Salida:     $0.19
+  PnL:        +$9.19 (ROE +6.32% | Price +2.11%)
+  Razón:      TAKE_PROFIT_3
+  Timeframe:  15m
+  Bot:        ScalpingTPFast
+  Fecha:      2025-10-12 17:46:44.729362

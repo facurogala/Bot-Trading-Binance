@@ -28,6 +28,11 @@ class OrderReconciler:
         self.client = trader.client
         self.monitoring_threads = {}  # {symbol: thread}
         self.active_monitors = {}  # {symbol: bool}
+        self._daemon_thread: Optional[threading.Thread] = None
+        self._daemon_running = False
+        self._daemon_interval = 30
+        self._daemon_bot = None
+        self._daemon_db = None
         
     def get_position_side(self, side: str) -> str:
         """
@@ -355,6 +360,157 @@ class OrderReconciler:
             
         except Exception as e:
             print(f"❌ Error cancelando órdenes recíprocas: {e}")
+
+    def start_protection_daemon(self, db, interval: int = 60, bot_name: Optional[str] = None):
+        """Inicia un hilo que audita posiciones y garantiza SL/TP activos."""
+        if self._daemon_running:
+            return
+
+        self._daemon_db = db
+        self._daemon_interval = max(interval, 10)
+        self._daemon_bot = bot_name
+        self._daemon_running = True
+        self._daemon_thread = threading.Thread(target=self._protection_loop, daemon=True)
+        self._daemon_thread.start()
+        print(f"🛡️ Protection daemon iniciado (intervalo {self._daemon_interval}s, bot={bot_name or 'ALL'})")
+
+    def stop_protection_daemon(self):
+        """Detiene el daemon de protección."""
+        self._daemon_running = False
+        if self._daemon_thread and self._daemon_thread.is_alive():
+            self._daemon_thread.join(timeout=2.0)
+        self._daemon_thread = None
+        print("🛡️ Protection daemon detenido")
+
+    def _protection_loop(self):
+        while self._daemon_running:
+            try:
+                self._run_protection_cycle()
+            except Exception as exc:
+                print(f"⚠️ Protection daemon error: {exc}")
+            finally:
+                time.sleep(self._daemon_interval)
+
+    def _run_protection_cycle(self):
+        if not self._daemon_db:
+            return
+
+        try:
+            open_trades = self._daemon_db.get_open_trades()
+        except Exception as exc:
+            print(f"⚠️ Protection daemon no pudo obtener trades: {exc}")
+            return
+
+        positions = {}
+        try:
+            for pos in self.trader.get_open_positions():
+                positions[pos['symbol']] = pos
+        except Exception as exc:
+            print(f"⚠️ Protection daemon no pudo obtener posiciones: {exc}")
+            return
+
+        for trade in open_trades:
+            if self._daemon_bot and trade.get('bot') != self._daemon_bot:
+                continue
+
+            symbol = trade.get('symbol')
+            if not symbol:
+                continue
+
+            position = positions.get(symbol)
+            if not position:
+                continue
+
+            tp_list = trade.get('tp_prices') or []
+            expected_tp = len(tp_list)
+
+            try:
+                verification_ok, sl_found, tp_count = self.trader._verify_protective_orders(
+                    symbol=symbol,
+                    require_sl=True,
+                    expected_tp=expected_tp
+                )
+            except Exception as exc:
+                print(f"⚠️ Protection daemon verificación falló para {symbol}: {exc}")
+                verification_ok = False
+                sl_found = False
+                tp_count = 0
+
+            if verification_ok:
+                continue
+
+            print(f"🛡️ Protection daemon detectó protección incompleta en {symbol} (trade {trade['id']}). Intentando recrear...")
+            quantity = position.get('quantity') or trade.get('quantity')
+            try:
+                qty_val = float(quantity)
+            except Exception:
+                qty_val = float(trade.get('quantity') or 0)
+
+            try:
+                sl_price = float(trade.get('sl_price') or 0)
+            except Exception:
+                sl_price = 0.0
+
+            try:
+                tp_prices = [float(p) for p in tp_list]
+            except Exception:
+                tp_prices = []
+
+            rebuild_ok = False
+            if qty_val > 0 and sl_price > 0 and tp_prices:
+                try:
+                    self.ensure_orders_exist(
+                        symbol=symbol,
+                        side=trade.get('side', 'LONG'),
+                        quantity=qty_val,
+                        sl_price=sl_price,
+                        tp_prices=tp_prices
+                    )
+                    verification_ok, sl_found, tp_count = self.trader._verify_protective_orders(
+                        symbol=symbol,
+                        require_sl=True,
+                        expected_tp=expected_tp
+                    )
+                    rebuild_ok = verification_ok
+                except Exception as exc:
+                    print(f"⚠️ Protection daemon no pudo recrear órdenes para {symbol}: {exc}")
+
+            if rebuild_ok:
+                try:
+                    self._daemon_db.log_trade_event(
+                        trade_id=trade['id'],
+                        event_type="PROTECTION_RESTORED",
+                        payload={
+                            "symbol": symbol,
+                            "sl_restored": True,
+                            "tp_count": expected_tp
+                        }
+                    )
+                except Exception:
+                    pass
+                continue
+
+            print(f"⚠️ Protection daemon no pudo restaurar protección en {symbol}. Ejecutando cierre de emergencia.")
+            flattened = self.trader.emergency_close_position(symbol)
+
+            try:
+                self._daemon_db.log_trade_event(
+                    trade_id=trade['id'],
+                    event_type="PROTECTION_FAIL",
+                    payload={
+                        "symbol": symbol,
+                        "sl_found": sl_found,
+                        "tp_count": tp_count,
+                        "emergency_close": flattened
+                    }
+                )
+            except Exception:
+                pass
+
+            if flattened:
+                print(f"✅ Protection daemon cerró posición {symbol} por protección incompleta.")
+            else:
+                print(f"⚠️ Protection daemon no pudo cerrar posición {symbol}. Revisar manualmente.")
     
     def monitor_orders(
         self,

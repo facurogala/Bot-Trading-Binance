@@ -14,7 +14,7 @@ def main():
     os.environ.setdefault("ORDER_MONITOR_INTERVAL", "20")
     load_dotenv(override=False)
 
-    trader = BinanceFuturesTrader()
+    trader = BinanceFuturesTrader(context="tp_adjustment_testnet_long")
 
     symbol = os.getenv("TP_TEST_SYMBOL", "BTCUSDT")
     side = os.getenv("TP_TEST_SIDE", "SHORT").upper()  # SHORT por defecto

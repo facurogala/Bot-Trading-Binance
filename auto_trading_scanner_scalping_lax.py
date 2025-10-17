@@ -10,13 +10,14 @@ Más frecuencia manteniendo control de riesgo:
 """
 
 import os
+import random
 import time
 from collections import Counter
 
 import pandas as pd
 import pandas_ta as ta
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from binance.client import Client
 
@@ -24,6 +25,8 @@ from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
 from auto_closer import AutoCloser
+from trade_monitor import TradeMonitor
+from trailing_stop_manager import TrailingStopManager, TrailingConfig
 from risk_utils import env_float, parse_float_list, risk_tp_prices
 
 # ================== CONFIG ==================
@@ -45,7 +48,7 @@ def _float_env(default, *keys):
 
 BOT_NAME = "ScalpingLax"
 MESSAGE_PREFIX = "[LAX]"
-BOT_ID = os.getenv("BOT_ID_SCALPING_LAX") or f"LAX-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
+BOT_ID = os.getenv("BOT_ID_SCALPING_LAX") or f"LAX-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 if not TOKEN or not CHAT_ID:
@@ -67,21 +70,20 @@ TIMEFRAME_NAMES = {
 client = Client()
 
 WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "NEARUSDT",
-    "FILUSDT", "ETCUSDT", "OPUSDT", "ARBUSDT", "ATOMUSDT",
-    "HBARUSDT", "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
-    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT", "FLOWUSDT",
-    "EGLDUSDT", "AXSUSDT", "IMXUSDT", "SANDUSDT", "MANAUSDT",
-    "ENJUSDT", "APEUSDT", "QNTUSDT", "DASHUSDT", "COMPUSDT",
-    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
-    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
-    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT", "ZILUSDT",
-    "RVNUSDT", "SSVUSDT", "ALGOUSDT", "CELOUSDT", "YFIUSDT",
-    "BAKEUSDT", "GTCUSDT", "HIGHUSDT", "IOSTUSDT", "KNCUSDT",
-    "LRCUSDT", "MTLUSDT", "OGNUSDT", "ONTUSDT", "STORJUSDT",
+    "AAVEUSDT", "ARBUSDT", "BCHUSDT", "CHZUSDT", "DOTUSDT", "ETHUSDT",
+    "GALAUSDT", "IMXUSDT", "KSMUSDT", "MANAUSDT", "PYTHUSDT", "SANDUSDT",
+    "STXUSDT", "TIAUSDT", "XRPUSDT", "0GUSDT", "1000SATSUSDT", "AEVOUSDT",
+    "ALPINEUSDT", "API3USDT", "ASTERUSDT", "AVNTUSDT", "BANANAS31USDT", "BATUSDT",
+    "BIOUSDT", "C98USDT", "CGPTUSDT", "COWUSDT", "DEXEUSDT", "EDUUSDT",
+    "ENJUSDT", "FXSUSDT", "HEMIUSDT", "HYPERUSDT", "IOTAUSDT", "JUPUSDT",
+    "KMNOUSDT", "LPTUSDT", "MASKUSDT", "MIRAUSDT", "MUBARAKUSDT", "NFPUSDT",
+    "OGUSDT", "ONTUSDT", "PENDLEUSDT", "PIXELUSDT", "PROVEUSDT", "REZUSDT",
+    "SAGAUSDT", "SHELLUSDT", "SOPHUSDT", "STORJUSDT", "SUPERUSDT", "TAOUSDT",
+    "TREEUSDT", "TUTUSDT", "USUALUSDT", "WCTUSDT", "WOOUSDT", "XPLUSDT",
+    "YGGUSDT",
 ]
+
+
 
 # ===== PRESET SCALPING_LAX =====
 ATR_PERIOD = 14
@@ -172,11 +174,30 @@ RISK_USD_PER_TRADE = env_float(
 )
 RISK_REWARD_TARGETS = parse_float_list(
     os.getenv("SCALPING_LAX_R_MULTIPLIERS", os.getenv("RISK_R_MULTIPLIERS_DEFAULT")),
-    default=(1.0, 1.5, 2.0)
+    default=(0.7, 1.2, 1.9)
 )
+
+# Trailing stop configuration
+TRAILING_MODE = (os.getenv("SCALPING_LAX_TRAILING_MODE", os.getenv("TRAILING_MODE_DEFAULT", "tp_lock")) or "tp_lock").strip().lower()
+TRAILING_FROM_TP = int(os.getenv("SCALPING_LAX_TRAILING_FROM_TP", os.getenv("TRAILING_FROM_TP", "1")))
+TRAILING_DYNAMIC_METHOD = (os.getenv("SCALPING_LAX_TRAILING_METHOD", os.getenv("TRAILING_METHOD_DEFAULT", "atr")) or "atr").strip().lower()
+TRAILING_ATR_MULT = _float_env(1.2, "SCALPING_LAX_TRAILING_ATR_MULT", "TRAILING_ATR_MULT")
+TRAILING_ATR_PERIOD = int(os.getenv("SCALPING_LAX_TRAILING_ATR_PERIOD", os.getenv("TRAILING_ATR_PERIOD", "14")))
+TRAILING_EMA_PERIOD = int(os.getenv("SCALPING_LAX_TRAILING_EMA_PERIOD", os.getenv("TRAILING_EMA_PERIOD", "34")))
+TRAILING_SWING_LOOKBACK = int(os.getenv("SCALPING_LAX_TRAILING_SWING_LOOKBACK", os.getenv("TRAILING_SWING_LOOKBACK", "5")))
+TRAILING_MIN_IMPROVEMENT_PCT = _float_env(0.0003, "SCALPING_LAX_TRAILING_MIN_IMPROVEMENT_PCT", "TRAILING_MIN_IMPROVEMENT_PCT")
+TRAILING_BE_BUFFER_PCT = _float_env(0.0, "SCALPING_LAX_BREAK_EVEN_BUFFER", "TRAILING_BREAK_EVEN_BUFFER")
+TRAILING_LOCK_BUFFER_PCT = _float_env(0.0, "SCALPING_LAX_TRAILING_LOCK_BUFFER", "TRAILING_LOCK_BUFFER")
+TRAILING_GUARD_TICKS = int(os.getenv("SCALPING_LAX_TRAILING_GUARD_TICKS", os.getenv("TRAILING_GUARD_TICKS", "2")))
+TRAILING_TIMEFRAME = os.getenv("SCALPING_LAX_TRAILING_TIMEFRAME", "15m")
+TRAILING_NOTIFY = os.getenv("SCALPING_LAX_TRAILING_NOTIFY", "True").lower() == "true"
 
 # Escaneo cada 3 minutos (ideal para 5m)
 SCAN_INTERVAL_SECONDS = 180
+STARTUP_JITTER_RANGE = (
+    _float_env(2.0, "SCALPING_LAX_JITTER_MIN", "STARTUP_JITTER_MIN", "JITTER_MIN"),
+    _float_env(5.0, "SCALPING_LAX_JITTER_MAX", "STARTUP_JITTER_MAX", "JITTER_MAX"),
+)
 
 # Ruta de base de datos y base de reportes
 DB_PATH = "trading_history.db"
@@ -190,32 +211,78 @@ _daily_trade_count = {}  # {YYYY-MM-DD: {"detected": int, "approved": int, "exec
 db = TradingDatabase(DB_PATH)
 trader = None
 auto_closer = None
+trailing_manager = None
+trade_monitor = None
 if AUTO_TRADE_ENABLED:
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context=BOT_NAME)
         print("✅ Trader de Binance Futures inicializado")
         try:
             auto_closer = AutoCloser(trader, db, bot_name=BOT_NAME)
             auto_closer.start()
         except Exception as e:
             print(f"⚠️ AutoCloser no pudo iniciar: {e}")
+        try:
+            trailing_config = TrailingConfig(
+                mode=TRAILING_MODE,
+                start_tp=max(1, TRAILING_FROM_TP),
+                dynamic_method=TRAILING_DYNAMIC_METHOD,
+                atr_period=TRAILING_ATR_PERIOD,
+                atr_mult=TRAILING_ATR_MULT,
+                ema_period=TRAILING_EMA_PERIOD,
+                swing_lookback=TRAILING_SWING_LOOKBACK,
+                min_improvement_pct=TRAILING_MIN_IMPROVEMENT_PCT,
+                break_even_buffer_pct=TRAILING_BE_BUFFER_PCT,
+                lock_tp_buffer_pct=TRAILING_LOCK_BUFFER_PCT,
+                guard_ticks=TRAILING_GUARD_TICKS,
+                timeframe_fallback=TRAILING_TIMEFRAME,
+                allow_notifications=TRAILING_NOTIFY,
+            )
+            trailing_manager = TrailingStopManager(
+                trader=trader,
+                db=db,
+                bot_name=BOT_NAME,
+                config=trailing_config,
+                notify_func=None,
+            )
+        except Exception as e:
+            trailing_manager = None
+            print(f"⚠️ TrailingStopManager no pudo iniciar: {e}")
+        try:
+            trade_monitor = TradeMonitor(trader, db, bot_name=BOT_NAME, trailing_manager=trailing_manager)
+            trade_monitor.start()
+        except Exception as e:
+            trade_monitor = None
+            print(f"⚠️ TradeMonitor no pudo iniciar: {e}")
+        if hasattr(trader, 'reconciler') and trader.reconciler:
+            try:
+                daemon_interval = int(os.getenv("PROTECTION_DAEMON_INTERVAL", "45"))
+                trader.reconciler.start_protection_daemon(db, interval=daemon_interval, bot_name=BOT_NAME)
+            except Exception as e:
+                print(f"⚠️ Protection daemon no pudo iniciar: {e}")
     except Exception as e:
         print(f"❌ Error al inicializar trader: {e}")
         print("⚠️ El bot funcionará solo en modo alerta (sin trading)")
         AUTO_TRADE_ENABLED = False
 
 # ================== UTILIDADES ==================
+from notifier import send_telegram as _notifier_send
+
+
 def send_telegram(message: str):
     if not message.startswith(MESSAGE_PREFIX):
         message = f"{MESSAGE_PREFIX} {message}"
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
+        return _notifier_send(message)
     except Exception as e:
-        print(f"[WARN] Telegram falló: {e}")
+        print(f"[WARN] notifier.send_telegram falló: {e}")
+        return False
+
+if TRAILING_NOTIFY and trailing_manager:
+    try:
+        trailing_manager.notify = send_telegram
+    except Exception:
+        pass
 
 def decimals_for(symbol: str) -> int:
     if symbol.endswith("USDT"): return 5
@@ -521,7 +588,7 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             print(f"⏳ Cooldown activo para {key}, omitiendo...")
             return False
 
-        day = datetime.utcnow().strftime("%Y-%m-%d")
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         day_stats = _daily_trade_count.get(day, {"approved": 0, "executed": 0, "detected": 0})
         if day_stats.get("executed", 0) >= MAX_TRADES_PER_DAY:
             print(f"⛔ Límite diario de ejecuciones alcanzado ({MAX_TRADES_PER_DAY}).")
@@ -614,6 +681,11 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             day_stats["executed"] = day_stats.get("executed", 0) + 1
             _daily_trade_count[day] = day_stats
             _last_trade_time[key] = now
+            if trade_monitor:
+                try:
+                    trade_monitor.register_trade(symbol, trade_id)
+                except Exception as tm_err:
+                    print(f"⚠️ TradeMonitor no pudo registrar {symbol}: {tm_err}")
             return True
     except Exception as e:
         print(f"❌ Error en execute_trade: {e}")
@@ -624,7 +696,7 @@ def run_scan_once():
     print("\n" + "="*60)
     print(f"⚡ ESCANEO {BOT_NAME.upper()}")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
-    print(datetime.utcnow().strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
+    print(datetime.now(timezone.utc).strftime("📅 %Y-%m-%d %H:%M:%S UTC"))
     print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 MODO SOLO ALERTAS")
     print("="*60)
     print(f"🛡️ Filtros activos ({BOT_NAME}):")
@@ -632,10 +704,12 @@ def run_scan_once():
     print(f"   ✅ Vol: 5m/15m ≥ {MIN_VOLUME_RATIO_5_15:.2f}x | 30m/1h ≥ {MIN_VOLUME_RATIO_30_60:.2f}x | RSI L: {RSI_LONG_MIN}-{RSI_LONG_MAX} / S: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ SL máx: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}–{MAX_ATR_PCT*100:.2f}%] | ADX≥{ADX_MIN}")
     print(f"   ✅ Score min: {MIN_SCORE_TO_TRADE:.2f} | Alineación TF: {'ON' if TIMEFRAME_ALIGNMENT else 'OFF'} | Funding bias: {'ON' if USE_FUNDING_BIAS else 'OFF'}")
+    trailing_label = TRAILING_MODE if TRAILING_MODE not in ("off", "none") else "OFF"
+    print(f"   ✅ Trailing SL: {trailing_label.upper()} desde TP{TRAILING_FROM_TP}")
     print("="*60)
 
     # control diario
-    day = datetime.utcnow().strftime("%Y-%m-%d")
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     day_stats = _daily_trade_count.get(day, {"approved":0, "executed":0, "detected":0})
     summary = {"detected": 0, "approved": 0, "rejected": 0, "executed": 0}
     rejection_reasons: Counter[str] = Counter()
@@ -788,7 +862,7 @@ def log_weekly_kpis():
 
 # ================== MAIN ==================
 def main():
-    print(f"🚀 Bot {BOT_NAME.upper()} + Auto Trading iniciado")
+    print("🚀 Bot SCALPING_LAX + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES)}")
     print(f"📊 Base de datos: {DB_PATH}")
@@ -807,22 +881,44 @@ def main():
     else:
         print("📢 MODO SOLO ALERTAS (trading desactivado)")
 
-    minutes = max(1, int(SCAN_INTERVAL_SECONDS/60))
+    minutes = max(1, int(SCAN_INTERVAL_SECONDS / 60))
     print(f"\n🛡️ FILTROS {BOT_NAME.upper()} ACTIVOS:")
     print(f"   ✅ Vol 5m/15m ≥ {MIN_VOLUME_RATIO_5_15:.2f}x | 30m/1h ≥ {MIN_VOLUME_RATIO_30_60:.2f}x")
     print(f"   ✅ RSI LONG: {RSI_LONG_MIN}-{RSI_LONG_MAX} | RSI SHORT: {RSI_SHORT_MIN}-{RSI_SHORT_MAX}")
     print(f"   ✅ Distancia EMAs: mín {MIN_EMA_DISTANCE*100:.2f}% | Slope mín {MIN_TREND_SLOPE*100:.2f}%")
     print(f"   ✅ SL máximo: {MAX_SL_PERCENT*100:.1f}% | ATR% [{MIN_ATR_PCT*100:.2f}-{MAX_ATR_PCT*100:.2f}]")
     print(f"   ✅ EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'} | Score min {MIN_SCORE_TO_TRADE}")
+
+    trailing_desc = "OFF"
+    config = getattr(trailing_manager, "config", None)
+    if config and getattr(config, "mode", "off").lower() not in ("off", "none"):
+        trailing_desc = f"{config.mode.upper()} desde TP{config.start_tp}"
+    elif TRAILING_MODE not in ("off", "none"):
+        trailing_desc = f"{TRAILING_MODE.upper()} desde TP{TRAILING_FROM_TP}"
+    print(f"   ✅ Trailing SL: {trailing_desc}")
+
     print(f"\n🔄 Escaneando cada {minutes} minutos...\n")
 
-    send_telegram(f"""⚡ <b>{BOT_NAME} iniciado</b>
-📊 {len(WATCHLIST)} cryptos
-⏰ TFs: {', '.join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES)}
-🔄 Escaneo cada {minutes} min
-🛡️ Score mínimo {MIN_SCORE_TO_TRADE} | Alineación TF: {TIMEFRAME_ALIGNMENT} | Funding: {USE_FUNDING_BIAS}
-🗃️ DB: {DB_PATH}
-📁 Reporte: reports/{REPORT_BASENAME}.png""")
+    trailing_for_msg = trailing_desc
+    send_telegram("""⚡ {bot} iniciado\n📊 {assets} cryptos\n⏰ TFs: {tfs}\n🔄 Escaneo cada {mins} min\n🛡️ Score mínimo {score:.2f} | Alineación TF: {align} | Funding: {funding}\n🛡️ Trailing SL: {trailing}\n🗃️ DB: {db}\n📁 Reporte: reports/{report}.png""".format(
+        bot=BOT_NAME,
+        assets=len(WATCHLIST),
+        tfs=", ".join(TIMEFRAME_NAMES[t] for t in TIMEFRAMES),
+        mins=minutes,
+        score=MIN_SCORE_TO_TRADE,
+        align="ON" if TIMEFRAME_ALIGNMENT else "OFF",
+        funding="ON" if USE_FUNDING_BIAS else "OFF",
+        trailing=trailing_for_msg,
+        db=DB_PATH,
+        report=REPORT_BASENAME,
+    ))
+
+    jitter_min, jitter_max = STARTUP_JITTER_RANGE
+    if jitter_max < jitter_min:
+        jitter_min, jitter_max = jitter_max, jitter_min
+    jitter_delay = random.uniform(jitter_min, jitter_max)
+    print(f"⏳ Jitter inicial: esperando {jitter_delay:.2f}s antes del primer escaneo")
+    time.sleep(jitter_delay)
 
     while True:
         try:
@@ -835,11 +931,17 @@ def main():
                     auto_closer.stop()
             except Exception:
                 pass
+            try:
+                if trade_monitor:
+                    trade_monitor.stop()
+            except Exception:
+                pass
             send_telegram(f"⚠️ {BOT_NAME} detenido")
             break
         except Exception as e:
             print(f"❌ Error inesperado: {e}")
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()

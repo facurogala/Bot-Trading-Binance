@@ -17,7 +17,7 @@ def check_all_orders():
     
     try:
         # Inicializar trader
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="check_orders")
         
         # Obtener todas las posiciones abiertas
         positions = trader.client.futures_position_information()

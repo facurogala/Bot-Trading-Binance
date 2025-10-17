@@ -26,7 +26,7 @@ def monitor_orders_realtime(interval: int = 10, duration: int = 300):
     print(f"Presiona Ctrl+C para detener\n")
     
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="monitor_orders_realtime")
         start_time = time.time()
         iteration = 0
         
@@ -156,7 +156,7 @@ def monitor_single_symbol(symbol: str, interval: int = 5, duration: int = 180):
     print(f"Presiona Ctrl+C para detener\n")
     
     try:
-        trader = BinanceFuturesTrader()
+        trader = BinanceFuturesTrader(context="monitor_orders_realtime")
         start_time = time.time()
         iteration = 0
         
