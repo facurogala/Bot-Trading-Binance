@@ -149,13 +149,17 @@ class BinanceFuturesTrader:
 
     # ---------------- Sizing por riesgo ----------------
 
-    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float) -> float:
+    def calculate_position_size(self, symbol: str, entry_price: float, sl_price: float,
+                                 min_margin_usdt: float = 0.0,
+                                 max_margin_usdt: float = 0.0) -> float:
         """
         Qty por riesgo %:
           - Riesgo monetario al SL ≈ qty * |entry - sl| (futuros USDT lineales)
           - NO dividir por leverage (no cambia el riesgo, sólo el margen requerido)
           - Capear notional a balance * leverage
           - Respetar LOT_SIZE y MIN_NOTIONAL
+          - Si max_margin_usdt > 0: cap margin (notional/leverage) a ese valor
+          - Si min_margin_usdt > 0: asegurar margin >= ese valor (o rechazar)
         """
         try:
             balance = self.get_account_balance()
@@ -175,6 +179,21 @@ class BinanceFuturesTrader:
                 qty_raw = max_notional / entry_price
                 notional = qty_raw * entry_price
 
+            # --- Clamp por margen USDT (min/max) ---
+            if max_margin_usdt > 0:
+                max_notional_by_margin = max_margin_usdt * self.leverage
+                if notional > max_notional_by_margin:
+                    qty_raw = max_notional_by_margin / entry_price
+                    notional = qty_raw * entry_price
+                    print(f"📏 Margin capped a {max_margin_usdt} USDT → notional {notional:.2f} USDT")
+
+            if min_margin_usdt > 0:
+                min_notional_by_margin = min_margin_usdt * self.leverage
+                if notional < min_notional_by_margin:
+                    qty_raw = min_notional_by_margin / entry_price
+                    notional = qty_raw * entry_price
+                    print(f"📏 Margin subido a mínimo {min_margin_usdt} USDT → notional {notional:.2f} USDT")
+
             # Ajustes por filtros del símbolo
             f = self._get_symbol_filters(symbol)
 
@@ -193,6 +212,13 @@ class BinanceFuturesTrader:
                 steps_needed = math.ceil((f["minNotional"] / entry_price) / f["stepSize"])
                 qty = steps_needed * f["stepSize"]
                 qty = self.round_step_size(qty, f["stepSize"])
+
+            # --- Validación final: si tras redondeo el margin excede el max, rechazar ---
+            if max_margin_usdt > 0:
+                final_margin = (qty * entry_price) / self.leverage
+                if final_margin > max_margin_usdt * 1.10:  # 10% tolerancia por redondeo
+                    print(f"⚠️ Margin final {final_margin:.2f} excede max {max_margin_usdt} USDT tras redondeo")
+                    return 0.0
 
             return max(qty, 0.0)
         except Exception as e:
@@ -219,17 +245,24 @@ class BinanceFuturesTrader:
         entry_price: float,
         sl_price: float,
         tp_prices: List[float],
-        force_market: bool = False
+        force_market: bool = False,
+        min_margin_usdt: float = 0.0,
+        max_margin_usdt: float = 0.0,
     ) -> Optional[Dict]:
         """
         Abre una posición en Binance Futures con SL y múltiples TPs.
+        min_margin_usdt / max_margin_usdt: clampean el margen (USDT) por trade.
         """
         try:
             # Configurar apalancamiento
             self.set_leverage(symbol, self.leverage)
 
             # Calcular tamaño de posición
-            quantity = self.calculate_position_size(symbol, entry_price, sl_price)
+            quantity = self.calculate_position_size(
+                symbol, entry_price, sl_price,
+                min_margin_usdt=min_margin_usdt,
+                max_margin_usdt=max_margin_usdt,
+            )
             if quantity <= 0:
                 print(f"❌ Cantidad calculada inválida: {quantity}")
                 return None
@@ -270,7 +303,13 @@ class BinanceFuturesTrader:
                     type="MARKET",
                     quantity=quantity
                 )
-                actual_entry = float(entry_order.get('avgPrice', entry_price_rounded))
+                avg_price_raw = entry_order.get('avgPrice', entry_price_rounded)
+                try:
+                    actual_entry = float(avg_price_raw)
+                except Exception:
+                    actual_entry = float(entry_price_rounded)
+                if actual_entry <= 0:
+                    actual_entry = float(entry_price_rounded)
                 print(f"✅ Orden de entrada (MARKET) ejecutada: {entry_order.get('orderId')}")
                 order_info = entry_order
             else:
@@ -313,13 +352,16 @@ class BinanceFuturesTrader:
                     print(f"⚠️ Error al esperar fill de la orden de entrada: {e}")
                     return None
 
-            # Cantidad real (por si hubo fill parcial)
+            # Cantidad real y entry real (por si hubo fill parcial o avgPrice vino en 0)
             actual_position_qty = quantity
             try:
                 positions_info = self.client.futures_position_information(symbol=symbol)
                 for p in positions_info:
                     if p['symbol'] == symbol:
                         actual_position_qty = abs(float(p.get('positionAmt', 0)))
+                        pos_entry = float(p.get('entryPrice', 0))
+                        if pos_entry > 0:
+                            actual_entry = pos_entry
                         break
             except Exception:
                 actual_position_qty = quantity
@@ -404,6 +446,16 @@ class BinanceFuturesTrader:
                             time.sleep(0.2)
                         except Exception as e:
                             print(f"⚠️ Error al configurar TP{i}: {e}")
+
+            if not sl_order:
+                print("❌ No se pudo confirmar Stop Loss. Activando cierre de seguridad...")
+                try:
+                    self.cancel_all_orders(symbol)
+                except Exception:
+                    pass
+
+                self.close_position(symbol)
+                return None
 
             result = {
                 'symbol': symbol,
@@ -504,7 +556,8 @@ class BinanceFuturesTrader:
                         symbol=symbol,
                         side=side,
                         type="MARKET",
-                        quantity=pos['quantity']
+                        quantity=pos['quantity'],
+                        reduceOnly=True
                     )
                     print(f"✅ Posición cerrada: {symbol}")
                     return True
@@ -522,6 +575,49 @@ class BinanceFuturesTrader:
             return True
         except Exception as e:
             print(f"❌ Error al cancelar órdenes: {e}")
+            return False
+
+    def update_stop_loss(self, symbol: str, side: str, new_sl_price: float) -> bool:
+        """Reemplaza el stop loss actual por uno nuevo para una posición abierta."""
+        try:
+            existing_orders = self.client.futures_get_open_orders(symbol=symbol)
+            stop_orders = []
+            for order in existing_orders:
+                order_type = order.get('type', '')
+                if order_type in ['STOP_MARKET', 'STOP']:
+                    stop_orders.append(order)
+
+            for stop_order in stop_orders:
+                try:
+                    self.client.futures_cancel_order(symbol=symbol, orderId=stop_order['orderId'])
+                except Exception:
+                    pass
+
+            created_order = None
+            if self.reconciler:
+                created_order = self.reconciler.create_stop_loss(symbol=symbol, side=side, sl_price=new_sl_price)
+            else:
+                sl_side = "SELL" if side == "LONG" else "BUY"
+                symbol_info = self.get_symbol_info(symbol)
+                if symbol_info:
+                    new_sl_price = round(new_sl_price, symbol_info.get('pricePrecision', 2))
+
+                created_order = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type="STOP_MARKET",
+                    stopPrice=new_sl_price,
+                    closePosition=True
+                )
+
+            if created_order:
+                print(f"🔒 SL actualizado en {symbol}: {new_sl_price}")
+                return True
+
+            print(f"⚠️ No se pudo crear el nuevo SL para {symbol}")
+            return False
+        except Exception as e:
+            print(f"❌ Error al actualizar Stop Loss en {symbol}: {e}")
             return False
 
 

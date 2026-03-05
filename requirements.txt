@@ -1,0 +1,6 @@
+pandas
+pandas-ta
+python-dotenv
+requests
+python-binance
+matplotlib

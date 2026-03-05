@@ -56,6 +56,50 @@ ENABLE_ORDER_MONITORING=True
 ORDER_MONITOR_DURATION=120
 ORDER_MONITOR_INTERVAL=15
 ORDER_FILL_TIMEOUT=30
+
+# Risk profile (nuevo)
+# AUTO => TESTNET_SAFE si TESTNET/USE_TESTNET=True, si no PROD_SAFE
+RISK_PROFILE=AUTO
+RISK_GUARD_ENABLED=True
+MAX_DAILY_LOSS_USDT=50
+MAX_CONSECUTIVE_LOSSES=3
+MAX_DRAWDOWN_PCT=12
+RISK_GUARD_PAUSE_MINUTES=180
+
+# Opcional para habilitar cálculo real de drawdown sobre equity
+RISK_GUARD_INITIAL_EQUITY_USDT=0
+
+# Límites globales cross-bot (0 = desactivado)
+MAX_GLOBAL_OPEN_POSITIONS=0
+MAX_GLOBAL_SYMBOL_POSITIONS=1
+MAX_GLOBAL_EXPOSURE_USDT=0
+MAX_SYMBOL_EXPOSURE_USDT=0
+```
+
+### Distribución de pares por estrategia
+
+- `Scalping`: lista reducida y líquida (alta ejecución, menor slippage)
+- `Swing`: lista intermedia (balance entre liquidez y cobertura)
+- `Haack`: lista amplia (más selectividad por filtros)
+
+### Perfiles de Riesgo (automáticos)
+
+- `RISK_PROFILE=AUTO` (recomendado):
+    - En testnet (`TESTNET=True` o `USE_TESTNET=True`) usa perfil `TESTNET_SAFE`.
+    - En producción usa perfil `PROD_SAFE`.
+- También puedes fijar `RISK_PROFILE=CONSERVATIVE` o `RISK_PROFILE=AGGRESSIVE`.
+- Si defines manualmente cualquier variable (`MAX_DAILY_LOSS_USDT`, etc.), ese valor tiene prioridad sobre el perfil.
+
+### Cambio rápido de entorno (PowerShell)
+
+Puedes cambiar el `.env` activo con un solo comando:
+
+```powershell
+# Activar perfil testnet
+powershell -ExecutionPolicy Bypass -File .\switch_env.ps1 -Profile testnet
+
+# Activar perfil producción
+powershell -ExecutionPolicy Bypass -File .\switch_env.ps1 -Profile production
 ```
 
 ### 4. Obtener API Keys de Binance Testnet

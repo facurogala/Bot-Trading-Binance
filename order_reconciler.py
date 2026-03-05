@@ -16,6 +16,7 @@ import time
 import threading
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+import re
 
 
 class OrderReconciler:
@@ -28,6 +29,127 @@ class OrderReconciler:
         self.client = trader.client
         self.monitoring_threads = {}  # {symbol: thread}
         self.active_monitors = {}  # {symbol: bool}
+        self.stop_limit_cooldown_seconds = 300
+        self.stop_limit_global_until = 0.0
+        self.last_cooldown_log_ts = 0.0
+        self.last_orphan_cleanup_ts = 0.0
+
+    def _extract_error_code(self, error: Exception) -> Optional[int]:
+        """Extrae code=-XXXX desde BinanceAPIException o string."""
+        code = getattr(error, 'code', None)
+        if code is not None:
+            try:
+                return int(code)
+            except Exception:
+                pass
+
+        text = str(error)
+        match = re.search(r'code=([-]?\d+)', text)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _is_stop_order_limit_error(self, error: Exception) -> bool:
+        code = self._extract_error_code(error)
+        if code == -4045:
+            return True
+        return "max stop order limit" in str(error).lower()
+
+    def _cleanup_orphan_protection_orders(self, max_cancel: int = 40) -> int:
+        """
+        Cancela órdenes de protección huérfanas (reduceOnly/closePosition)
+        en símbolos sin posición abierta. Ayuda a liberar cupo de stop orders.
+        """
+        now = time.time()
+        if (now - self.last_orphan_cleanup_ts) < 120:
+            return 0
+        self.last_orphan_cleanup_ts = now
+
+        try:
+            open_orders = self.client.futures_get_open_orders()
+        except Exception as e:
+            print(f"⚠️ No se pudo listar órdenes para limpieza de huérfanas: {e}")
+            return 0
+
+        candidates = []
+        for order in open_orders:
+            order_type = order.get('type', '')
+            if 'STOP' not in order_type and 'TAKE_PROFIT' not in order_type:
+                continue
+
+            reduce_only = str(order.get('reduceOnly', '')).lower() == 'true'
+            close_position = str(order.get('closePosition', '')).lower() == 'true'
+            if reduce_only or close_position:
+                candidates.append(order)
+
+        if not candidates:
+            return 0
+
+        cancelled = 0
+        checked_symbols = {}
+
+        for order in candidates:
+            if cancelled >= max_cancel:
+                break
+
+            symbol = order.get('symbol')
+            order_id = order.get('orderId')
+            if not symbol or not order_id:
+                continue
+
+            if symbol not in checked_symbols:
+                try:
+                    positions = self.client.futures_position_information(symbol=symbol)
+                    position_amt = 0.0
+                    for pos in positions:
+                        if pos.get('symbol') == symbol:
+                            position_amt = abs(float(pos.get('positionAmt', 0)))
+                            break
+                    checked_symbols[symbol] = position_amt > 0
+                except Exception:
+                    checked_symbols[symbol] = True
+
+            has_open_position = checked_symbols[symbol]
+            if has_open_position:
+                continue
+
+            try:
+                self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                cancelled += 1
+            except Exception:
+                pass
+
+        if cancelled > 0:
+            print(f"🧹 Limpieza automática: {cancelled} orden(es) de protección huérfana(s) cancelada(s)")
+
+        return cancelled
+
+    def _activate_stop_limit_cooldown(self, error: Exception):
+        """Activa cooldown global para evitar reintentos inútiles con code -4045."""
+        _ = self._cleanup_orphan_protection_orders()
+        until = time.time() + self.stop_limit_cooldown_seconds
+        self.stop_limit_global_until = max(self.stop_limit_global_until, until)
+        print(
+            f"⛔ Límite de stop orders alcanzado (-4045). "
+            f"Se pausa creación de SL/TP por {self.stop_limit_cooldown_seconds}s."
+        )
+
+    def _is_stop_limit_cooldown_active(self) -> bool:
+        return time.time() < self.stop_limit_global_until
+
+    def _log_cooldown_skip(self, symbol: str):
+        now = time.time()
+        if now - self.last_cooldown_log_ts < 60:
+            return
+        self.last_cooldown_log_ts = now
+        remaining = int(max(0, self.stop_limit_global_until - now))
+        print(
+            f"⏸️ {symbol}: reconciliación SL/TP omitida temporalmente "
+            f"(cooldown -4045 activo, restan ~{remaining}s)"
+        )
         
     def get_position_side(self, side: str) -> str:
         """
@@ -61,8 +183,9 @@ class OrderReconciler:
             
             for order in orders:
                 order_type = order.get('type', '')
+                is_close_position = str(order.get('closePosition', '')).lower() == 'true'
                 
-                if 'STOP' in order_type and 'TAKE_PROFIT' not in order_type:
+                if ('STOP' in order_type and 'TAKE_PROFIT' not in order_type) or is_close_position:
                     categorized['stop_loss'].append(order)
                 elif 'TAKE_PROFIT' in order_type:
                     categorized['take_profit'].append(order)
@@ -186,6 +309,24 @@ class OrderReconciler:
             return sl_order
             
         except Exception as e:
+            if self._is_stop_order_limit_error(e):
+                self._activate_stop_limit_cooldown(e)
+                return None
+            # -4130: ya existe un stop con closePosition en esa dirección → buscar y devolver el existente
+            if self._extract_error_code(e) == -4130:
+                print(f"⚠️ SL con closePosition ya existe en Binance para {symbol}, buscando orden existente...")
+                try:
+                    open_orders = self.client.futures_get_open_orders(symbol=symbol)
+                    for o in open_orders:
+                        otype = o.get('type', '')
+                        is_close = str(o.get('closePosition', '')).lower() == 'true'
+                        if ('STOP' in otype and 'TAKE_PROFIT' not in otype) or is_close:
+                            print(f"✅ Stop Loss existente encontrado: {o.get('orderId')} @ {o.get('stopPrice')}")
+                            return o
+                except Exception as lookup_e:
+                    print(f"⚠️ No se pudo buscar SL existente: {lookup_e}")
+                # Devolver un placeholder para evitar reintentos
+                return {'orderId': None, 'type': 'STOP_MARKET', 'stopPrice': sl_price, '_existing': True}
             print(f"❌ Error creando Stop Loss: {e}")
             return None
     
@@ -243,6 +384,9 @@ class OrderReconciler:
             return tp_order
             
         except Exception as e:
+            if self._is_stop_order_limit_error(e):
+                self._activate_stop_limit_cooldown(e)
+                return None
             print(f"❌ Error creando Take Profit: {e}")
             return None
     
@@ -266,6 +410,14 @@ class OrderReconciler:
         
         # Verificar órdenes existentes
         existing = self.get_existing_orders(symbol)
+
+        # Si Binance está en límite de stop orders, no insistir en este ciclo
+        if self._is_stop_limit_cooldown_active():
+            sl_existing = existing['stop_loss'][0] if existing['stop_loss'] else None
+            tp_existing = existing['take_profit'][:len(tp_prices)]
+            if sl_existing is None or len(tp_existing) < len(tp_prices):
+                self._log_cooldown_skip(symbol)
+            return sl_existing, tp_existing
         
         # Stop Loss
         sl_order = None
@@ -274,6 +426,8 @@ class OrderReconciler:
             for attempt in range(max_retries):
                 sl_order = self.create_stop_loss(symbol, side, sl_price, position_side)
                 if sl_order:
+                    break
+                if self._is_stop_limit_cooldown_active():
                     break
                 time.sleep(1)
         else:
@@ -309,7 +463,12 @@ class OrderReconciler:
                     if tp_order:
                         tp_orders.append(tp_order)
                         break
+                    if self._is_stop_limit_cooldown_active():
+                        break
                     time.sleep(1)
+
+                if self._is_stop_limit_cooldown_active():
+                    break
         else:
             tp_orders = existing['take_profit'][:needed_tps]
             print(f"✅ Take Profits ya existen: {len(tp_orders)} órdenes")

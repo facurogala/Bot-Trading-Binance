@@ -27,10 +27,14 @@ from dotenv import load_dotenv
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import generate_quick_report, TradingDashboard
+from risk_guard import RiskGuard
+from risk_profiles import apply_risk_profile_defaults
+from bot_watchlists import HAACK_WATCHLIST
 
 
 # ================== CONFIG ==================
 load_dotenv()
+RISK_PROFILE_SNAPSHOT = apply_risk_profile_defaults()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -42,6 +46,7 @@ if not TOKEN or not CHAT_ID:
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))  # Haack: hasta 6 posiciones
+BOT_NAME = "Haack"
 
 # Timeframes generales (enfoque más lento)
 TIMEFRAMES = ["4h", "12h", "1d"]
@@ -55,22 +60,7 @@ TIMEFRAME_NAMES = {
 client = Client()
 
 # 70 coins — cobertura amplia en Futures (moderado)
-WATCHLIST: List[str] = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "NEARUSDT",
-    "FILUSDT", "ETCUSDT", "OPUSDT", "ARBUSDT", "ATOMUSDT",
-    "HBARUSDT", "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
-    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT", "FLOWUSDT",
-    "EGLDUSDT", "AXSUSDT", "IMXUSDT", "SANDUSDT", "MANAUSDT",
-    "ENJUSDT", "APEUSDT", "QNTUSDT", "DASHUSDT", "COMPUSDT",
-    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
-    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
-    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT", "ZILUSDT",
-    "RVNUSDT", "SSVUSDT", "ALGOUSDT", "CELOUSDT", "YFIUSDT",
-    "BAKEUSDT", "GTCUSDT", "HIGHUSDT", "IOSTUSDT", "KNCUSDT",
-    "LRCUSDT", "MTLUSDT", "OGNUSDT", "ONTUSDT", "STORJUSDT",
-]
+WATCHLIST: List[str] = list(HAACK_WATCHLIST)
 
 # ====== Preset de calidad: HAACK (medio) ======
 # Riesgo y niveles (equilibrado)
@@ -117,17 +107,18 @@ REQUIRE_CLOSE_IN_DIRECTION = True
 STRUCT_REQUIRE_HH_HL = True
 STRUCT_SWING_DEPTH = 3
 ADX_FILTER = True
-ADX_MIN = 18
+ADX_MIN = 14
 MIN_BODY_TO_RANGE = 0.5
 MAX_UPWICK_FOR_LONG = 0.4
 MAX_DOWNWICK_FOR_SHORT = 0.4
 
 # Timing y confirmaciones
 TIMEFRAME_ALIGNMENT = True
-ALIGN_WITH = ["12h", "1d"]
+ALIGN_WITH = ["12h"]
 MIN_TICKS_SINCE_SIGNAL = 2
 BLOCK_NEWS_SPIKES = True
 ALLOW_SESSION = ["UTC_10_24"]
+ALLOW_CONTINUATION_SIGNALS = True
 
 # Perps/Funding
 USE_FUNDING_BIAS = True
@@ -173,11 +164,11 @@ SCORE_W = {
     "multi_tf_alignment": 1.0,
     "impulse": 2.0,              # bonus por vela de impulso (H1/H4)
 }
-MIN_SCORE_TO_TRADE = 6.0  # ajustá según selectividad deseada
+MIN_SCORE_TO_TRADE = 4.8  # modo más activo
 
 # Gestión / Frecuencia
 MAX_CONCURRENT_POS = 3
-COOLDOWN_AFTER_TRADE_MIN = 30
+COOLDOWN_AFTER_TRADE_MIN = 15
 MAX_TRADES_PER_DAY = 10
 POSITION_SIZE_MULT = 1.0  # Nota: informativo (ajuste fino requiere cambios en trader)
 LEVERAGE_CAP = 5
@@ -187,9 +178,26 @@ PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 # Intervalo entre escaneos
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
 
+# Gestión dinámica de Stop Loss (Haack)
+DYNAMIC_SL_ENABLED = os.getenv("HAACK_DYNAMIC_SL_ENABLED", os.getenv("DYNAMIC_SL_ENABLED", "True")).lower() == "true"
+BREAKEVEN_ON_TP1 = os.getenv("HAACK_BREAKEVEN_ON_TP1", os.getenv("BREAKEVEN_ON_TP1", "True")).lower() == "true"
+BREAKEVEN_OFFSET_PCT = float(os.getenv("HAACK_BREAKEVEN_OFFSET_PCT", os.getenv("BREAKEVEN_OFFSET_PCT", "0.0")))
+TRAILING_ATR_ENABLED = os.getenv("HAACK_TRAILING_ATR_ENABLED", os.getenv("TRAILING_ATR_ENABLED", "True")).lower() == "true"
+TRAILING_ATR_MULT = float(os.getenv("HAACK_TRAILING_ATR_MULT", "1.4"))
+TRAILING_ATR_TIMEFRAME = os.getenv("HAACK_TRAILING_ATR_TIMEFRAME", "4h")
+MIN_SL_MOVE_PERCENT = float(os.getenv("HAACK_MIN_SL_MOVE_PERCENT", "0.0015"))
+EARLY_PROFIT_TAKE_ENABLED = os.getenv("HAACK_EARLY_PROFIT_TAKE_ENABLED", os.getenv("EARLY_PROFIT_TAKE_ENABLED", "True")).lower() == "true"
+EARLY_PROFIT_TAKE_USDT = float(os.getenv("HAACK_EARLY_PROFIT_TAKE_USDT", os.getenv("EARLY_PROFIT_TAKE_USDT", "10.0")))
+
+# Límites de margen (USDT real invertido) por trade
+MIN_MARGIN_USDT = float(os.getenv("HAACK_MIN_MARGIN_USDT", os.getenv("MIN_MARGIN_USDT", "25.0")))
+MAX_MARGIN_USDT = float(os.getenv("HAACK_MAX_MARGIN_USDT", os.getenv("MAX_MARGIN_USDT", "50.0")))
+
 # Estado runtime (cooldown y límites diarios)
 _last_trade_time: Dict[str, float] = {}           # clave: f"{symbol}:{timeframe}"
 _daily_trade_count: Dict[str, int] = {}           # clave día YYYY-MM-DD
+_trade_wallet_baseline: Dict[int, float] = {}
+_last_wallet_balance_snapshot: Optional[float] = None
 
 # ====== Impulsos (sensibilidad H1 / H4) ======
 IMPULSE_ENABLED = True
@@ -221,6 +229,208 @@ def send_telegram(message: str):
             print(f"⚠️ Error Telegram: {r.status_code} -> {r.text}")
     except Exception as e:
         print(f"[WARN] Telegram falló: {e}")
+
+
+def get_wallet_balance_usdt(trader: Optional[BinanceFuturesTrader]) -> Optional[float]:
+    if trader is None:
+        return None
+    try:
+        account = trader.client.futures_account(recvWindow=60000)
+        for asset in account.get('assets', []):
+            if asset.get('asset') == 'USDT':
+                return float(asset.get('walletBalance', 0))
+    except Exception as e:
+        print(f"⚠️ No se pudo leer walletBalance (Haack): {e}")
+
+    try:
+        return float(trader.get_account_balance())
+    except Exception:
+        return None
+
+
+def _to_millis(dt_value) -> int:
+    if dt_value is None:
+        return 0
+    try:
+        s = str(dt_value).strip()
+        if not s:
+            return 0
+        parsed = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        return int(parsed.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def detect_close_reason_and_price(
+    trader: Optional[BinanceFuturesTrader],
+    symbol: str,
+    trade: Dict,
+) -> Tuple[str, float]:
+    reason = "CLOSE"
+    exit_price = 0.0
+
+    if trader is None:
+        return reason, exit_price
+
+    try:
+        entry_ms = _to_millis(trade.get('entry_time'))
+        orders = trader.client.futures_get_all_orders(symbol=symbol, limit=120)
+        close_candidates = []
+
+        for order in orders:
+            if order.get('status') != 'FILLED':
+                continue
+
+            order_type = str(order.get('type', ''))
+            if order_type not in ['STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'MARKET']:
+                continue
+
+            update_ms = int(order.get('updateTime') or order.get('time') or 0)
+            if entry_ms and update_ms and update_ms < entry_ms:
+                continue
+
+            if order_type == 'MARKET':
+                reduce_only = str(order.get('reduceOnly', '')).lower() == 'true'
+                close_position = str(order.get('closePosition', '')).lower() == 'true'
+                if not reduce_only and not close_position:
+                    continue
+
+            close_candidates.append(order)
+
+        if close_candidates:
+            last_order = max(close_candidates, key=lambda x: int(x.get('updateTime') or x.get('time') or 0))
+            order_type = str(last_order.get('type', ''))
+
+            if 'TAKE_PROFIT' in order_type:
+                reason = 'TP'
+            elif 'STOP' in order_type:
+                reason = 'SL'
+            else:
+                reason = 'CLOSE'
+
+            # Calcular precio de salida promedio ponderado por cantidad
+            total_qty = 0.0
+            weighted_price = 0.0
+            for c in close_candidates:
+                avg_p = float(c.get('avgPrice') or 0)
+                exec_qty = float(c.get('executedQty') or 0)
+                if avg_p > 0 and exec_qty > 0:
+                    weighted_price += avg_p * exec_qty
+                    total_qty += exec_qty
+            
+            if total_qty > 0 and weighted_price > 0:
+                exit_price = weighted_price / total_qty
+            else:
+                exit_price = float(last_order.get('avgPrice') or 0)
+                if exit_price <= 0:
+                    exit_price = float(last_order.get('stopPrice') or last_order.get('price') or 0)
+    except Exception as e:
+        print(f"⚠️ No se pudo detectar motivo de cierre (Haack) en {symbol}: {e}")
+
+    return reason, exit_price
+
+
+def send_close_summary_telegram(
+    trade: Dict,
+    close_reason: str,
+    exit_price: float,
+    wallet_before: Optional[float],
+    wallet_after: Optional[float],
+):
+    symbol = trade.get('symbol', '')
+    side = trade.get('side', '')
+    entry_price = float(trade.get('entry_price') or 0)
+    quantity = float(trade.get('quantity') or 0)
+    leverage = int(trade.get('leverage') or 1)
+
+    notional = entry_price * quantity
+    margin_used = notional / leverage if leverage > 0 else notional
+
+    if side == 'LONG':
+        pnl = (exit_price - entry_price) * quantity
+    else:
+        pnl = (entry_price - exit_price) * quantity
+
+    pnl_pct = ((pnl / margin_used) * 100) if margin_used > 0 else 0.0
+    wallet_delta = None
+    if wallet_before is not None and wallet_after is not None:
+        wallet_delta = float(wallet_after) - float(wallet_before)
+
+    reason_emoji = '🟢 TP' if close_reason == 'TP' else ('🔴 SL' if close_reason == 'SL' else '⚪ CIERRE')
+    result_emoji = '📈' if pnl >= 0 else '📉'
+
+    message = (
+        f"✅ <b>OPERACIÓN CERRADA</b>\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+        f"📌 Par: {display_symbol(symbol)} {side}\n"
+        f"🏁 Motivo: <b>{reason_emoji}</b>\n\n"
+        f"💵 Invertido (margen): {margin_used:.2f} USDT\n"
+        f"📦 Notional: {notional:.2f} USDT (x{leverage})\n"
+        f"🎯 Entrada: {entry_price:.6f}\n"
+        f"🚪 Salida: {exit_price:.6f}\n\n"
+        f"{result_emoji} Resultado: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
+    )
+
+    if wallet_before is not None:
+        message += f"💰 Wallet anterior: {float(wallet_before):.2f} USDT\n"
+    if wallet_after is not None:
+        message += f"🏦 Wallet final: {float(wallet_after):.2f} USDT\n"
+    if wallet_delta is not None:
+        message += f"📊 Cambio wallet: <b>{wallet_delta:+.2f} USDT</b>\n"
+
+    send_telegram(message)
+
+
+def reconcile_closed_trades_and_notify(trader: Optional[BinanceFuturesTrader], db: TradingDatabase):
+    global _last_wallet_balance_snapshot
+
+    if not AUTO_TRADE_ENABLED or trader is None:
+        return
+
+    try:
+        positions = trader.get_open_positions()
+        open_symbols = {p['symbol'] for p in positions}
+
+        open_trades = [
+            t for t in db.get_open_trades()
+            if str(t.get('bot') or '').lower() == BOT_NAME.lower()
+        ]
+
+        for trade in open_trades:
+            symbol = trade.get('symbol')
+            if symbol in open_symbols:
+                continue
+
+            trade_id = int(trade.get('id'))
+            close_reason, exit_price = detect_close_reason_and_price(trader, symbol, trade)
+
+            if exit_price <= 0:
+                try:
+                    ticker = client.get_symbol_ticker(symbol=symbol)
+                    exit_price = float(ticker['price'])
+                except Exception:
+                    exit_price = float(trade.get('entry_price') or 0)
+
+            db_exit_reason = 'TAKE_PROFIT' if close_reason == 'TP' else ('STOP_LOSS' if close_reason == 'SL' else 'SYNC_CLOSE')
+            db.close_trade(trade_id, exit_price=exit_price, exit_reason=db_exit_reason)
+
+            wallet_before = _trade_wallet_baseline.pop(trade_id, None)
+            if wallet_before is None:
+                wallet_before = _last_wallet_balance_snapshot
+            wallet_after = get_wallet_balance_usdt(trader)
+
+            send_close_summary_telegram(
+                trade=trade,
+                close_reason=close_reason,
+                exit_price=exit_price,
+                wallet_before=wallet_before,
+                wallet_after=wallet_after,
+            )
+
+            if wallet_after is not None:
+                _last_wallet_balance_snapshot = wallet_after
+    except Exception as e:
+        print(f"⚠️ Error reconciliando cierres Haack: {e}")
 
 
 def html_escape(s: str) -> str:
@@ -890,9 +1100,9 @@ def build_levels(side: str, last_row: pd.Series, df: pd.DataFrame, symbol: str, 
     # TPs
     if TP_MULTS is None:
         if side == "LONG":
-            tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+            tps = [price + TP_ATR_MULT * atr * m for m in [0.6, 0.8, 1.0]]
         else:
-            tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+            tps = [price - TP_ATR_MULT * atr * m for m in [0.6, 0.8, 1.0]]
     else:
         if side == "LONG":
             tps = [price + m * atr for m in TP_MULTS]
@@ -921,21 +1131,36 @@ def build_levels(side: str, last_row: pd.Series, df: pd.DataFrame, symbol: str, 
 
 def format_trade_message(symbol: str, side: str, levels: Dict, timeframe: str, traded: bool = False) -> str:
     s = display_symbol(symbol)
-    action = "🚀 EJECUTADO" if traded else "👀 SEÑAL"
+    action = "🚀 <b>TRADE EJECUTADO</b>" if traded else "📣 <b>SEÑAL DETECTADA</b>"
     imp = levels.get("impulse_flag", False)
     imp_txt = " ⚡IMPULSO" if imp else ""
     return (
-        f"{action} {side} — {s} [{timeframe}]{imp_txt}\n"
-        f"Precio: {levels['price']}\n"
-        f"Entrada: {levels['entry_low']} - {levels['entry_high']}\n"
-        f"SL: {levels['sl']}\n"
-        f"TPs: {levels['tp1']} | {levels['tp2']} | {levels['tp3']}"
+        f"{action}\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+        f"📌 Par: <b>{s}</b> {'🟢 LONG' if side=='LONG' else '🔴 SHORT'}{imp_txt}\n"
+        f"⏰ Timeframe: {timeframe}\n\n"
+        f"📍 Zona entrada: {levels['entry_low']} - {levels['entry_high']}\n"
+        f"🔴 SL: {levels['sl']}\n"
+        f"🟢 TP1: {levels['tp1']}\n"
+        f"🟢 TP2: {levels['tp2']}\n"
+        f"🟢 TP3: {levels['tp3']}\n\n"
+        f"💰 Precio actual: {levels['price']}"
     )
 
 
-def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str, side: str, levels: Dict, timeframe: str) -> Optional[Dict]:
+def execute_trade(
+    trader: BinanceFuturesTrader,
+    db: TradingDatabase,
+    symbol: str,
+    side: str,
+    levels: Dict,
+    timeframe: str,
+    risk_guard: Optional[RiskGuard] = None,
+) -> Optional[Dict]:
     """Ejecuta el trade respetando límites y guarda en DB."""
     try:
+        wallet_before_trade = get_wallet_balance_usdt(trader)
+
         # Cooldown por símbolo/timeframe
         key = f"{symbol}:{timeframe}"
         now = time.time()
@@ -951,7 +1176,20 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
             return None
 
+        if risk_guard is not None:
+            can_trade, reason = risk_guard.can_open_trade(symbol=symbol)
+            if not can_trade:
+                print(f"🛑 RiskGuard bloqueó trade en {symbol}: {reason}")
+                return None
+
         open_positions = trader.get_open_positions() if trader else []
+
+        # Verificar si ya hay posición abierta en este símbolo
+        for pos in open_positions:
+            if pos['symbol'] == symbol:
+                print(f"⚠️ Ya existe una posición abierta en {symbol}, omitiendo...")
+                return None
+
         # Límite de concurrencia por preset
         max_conc = min(MAX_CONCURRENT_POS, MAX_POSITIONS)
         if len(open_positions) >= max_conc:
@@ -969,6 +1207,8 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             sl_price=sl_price,
             tp_prices=tp_prices,
             force_market=USE_MARKET_ORDER,
+            min_margin_usdt=MIN_MARGIN_USDT,
+            max_margin_usdt=MAX_MARGIN_USDT,
         )
 
         if not result:
@@ -987,8 +1227,47 @@ def execute_trade(trader: BinanceFuturesTrader, db: TradingDatabase, symbol: str
             bot="Haack",
         )
 
+        # Registrar órdenes individuales en DB
+        try:
+            db.add_order(
+                trade_id=trade_id,
+                order_id=str(result['entry_order']['orderId']),
+                order_type="ENTRY",
+                side=result['entry_order']['side'],
+                symbol=symbol,
+                price=result.get('entry_price', entry_price),
+                quantity=result.get('quantity', 0),
+                status="FILLED"
+            )
+            if result.get('sl_order'):
+                db.add_order(
+                    trade_id=trade_id,
+                    order_id=str(result['sl_order']['orderId']),
+                    order_type="STOP_LOSS",
+                    side=result['sl_order']['side'],
+                    symbol=symbol,
+                    price=sl_price,
+                    quantity=result.get('quantity', 0),
+                    status="NEW"
+                )
+            for i, tp_order in enumerate(result.get('tp_orders', []), 1):
+                db.add_order(
+                    trade_id=trade_id,
+                    order_id=str(tp_order['orderId']),
+                    order_type=f"TAKE_PROFIT_{i}",
+                    side=tp_order['side'],
+                    symbol=symbol,
+                    price=tp_order.get('stopPrice', tp_order.get('price', 0)),
+                    quantity=tp_order.get('origQty', 0),
+                    status="NEW"
+                )
+        except Exception as e:
+            print(f"⚠️ Error al registrar órdenes individuales en DB (Haack): {e}")
+
         _last_trade_time[key] = now
         _daily_trade_count[day] = cnt + 1
+        if wallet_before_trade is not None:
+            _trade_wallet_baseline[int(trade_id)] = float(wallet_before_trade)
         return {"trade_id": trade_id, **result}
     except Exception as e:
         print(f"❌ Error en execute_trade: {e}")
@@ -1027,6 +1306,16 @@ def analyze(symbol: str, timeframe: str) -> Optional[Dict]:
             elif tk_cross_short:
                 side = "SHORT"
 
+    # Fallback: continuación de tendencia (evita depender de un cruce exacto en la vela actual)
+    if side is None and ALLOW_CONTINUATION_SIGNALS:
+        ema20_now = float(last["EMA20"])
+        ema50_now = float(last["EMA50"])
+        close_now = float(last["close"])
+        if ema20_now > ema50_now and close_now >= ema20_now:
+            side = "LONG"
+        elif ema20_now < ema50_now and close_now <= ema20_now:
+            side = "SHORT"
+
     # Fallback final: impulso puro en TF permitidos
     if side is None and IMPULSE_ENABLED and impulse_tf_allowed(symbol, timeframe):
         imp_long, _ = detect_impulse(df, "LONG", timeframe, symbol)
@@ -1064,14 +1353,15 @@ def analyze(symbol: str, timeframe: str) -> Optional[Dict]:
     return {"symbol": symbol, "side": side, "levels": levels, "metrics": check}
 
 
-def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> None:
+def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase, risk_guard: Optional[RiskGuard] = None) -> None:
     """Escanea toda la watchlist en todos los timeframes una vez, con resumen por símbolo."""
     # Encabezado estilo conservador
     print("\n" + "="*60)
     print("🛡️ ESCANEO HAACK")
     print(f"🔍 {len(WATCHLIST)} cryptos en {len(TIMEFRAMES)} timeframes")
     print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("🤖 TRADING AUTOMÁTICO ACTIVADO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS")
+    runtime_auto_trade = AUTO_TRADE_ENABLED and (trader is not None)
+    print("🤖 TRADING AUTOMÁTICO ACTIVADO" if runtime_auto_trade else "📢 SOLO ALERTAS")
     print("="*60)
     print("🛡️ Filtros activos:")
     print(f"   ✅ Tendencia EMA200 requerida: {'Sí' if REQUIRE_EMA200_TREND else 'No'}")
@@ -1083,7 +1373,7 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
     print(f"   ✅ ADX min: {ADX_MIN} | Estructura HH/HL: {'Sí' if STRUCT_REQUIRE_HH_HL else 'No'}")
     print(f"   ✅ Alineación TF: {'Sí' if TIMEFRAME_ALIGNMENT else 'No'} -> {', '.join(ALIGN_WITH) if TIMEFRAME_ALIGNMENT else '-'}")
     print(f"   ✅ Ichimoku: {'ON' if USE_ICHI else 'OFF'} | Híbrido: {'ON' if USE_HYBRID else 'OFF'}")
-    print(f"   ✅ Prioridad a cruces EMA20/EMA50; sensibilidad a impulsos en 1h/4h")
+    print(f"   ✅ Señales por cruce + continuación EMA; sensibilidad a impulsos en 1h/4h")
     print("="*60)
 
     total_signals = 0
@@ -1131,7 +1421,7 @@ def scan_once(trader: Optional[BinanceFuturesTrader], db: TradingDatabase) -> No
                 send_telegram(msg)
 
                 if AUTO_TRADE_ENABLED and trader is not None:
-                    res = execute_trade(trader, db, symbol, signal["side"], signal["levels"], timeframe)
+                    res = execute_trade(trader, db, symbol, signal["side"], signal["levels"], timeframe, risk_guard=risk_guard)
                     if res:
                         executed += 1
                         send_telegram(format_trade_message(symbol, signal["side"], signal["levels"], timeframe, traded=True))
@@ -1200,12 +1490,147 @@ def show_positions_summary(trader: Optional[BinanceFuturesTrader]):
         print(f"⚠️ No se pudo obtener posiciones: {e}")
 
 
+def manage_dynamic_stop_losses(trader: Optional[BinanceFuturesTrader], db: TradingDatabase):
+    """Mueve SL de Haack a breakeven y/o trailing ATR sin empeorar riesgo."""
+    if not AUTO_TRADE_ENABLED or trader is None or not DYNAMIC_SL_ENABLED:
+        return
+
+    try:
+        positions = trader.get_open_positions()
+        if not positions:
+            return
+
+        open_trades = [
+            t for t in db.get_open_trades()
+            if str(t.get('bot') or '').lower() == BOT_NAME.lower()
+        ]
+        trade_by_symbol = {t['symbol']: t for t in open_trades}
+
+        for pos in positions:
+            symbol = pos['symbol']
+            side = pos['side']
+            qty = float(pos.get('quantity', 0))
+            entry = float(pos['entryPrice'])
+            upnl = float(pos.get('unrealizedProfit', 0))
+
+            current_sl = pos.get('stopLoss')
+            trade = trade_by_symbol.get(symbol)
+            if not trade:
+                continue
+
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+
+            if EARLY_PROFIT_TAKE_ENABLED and upnl >= EARLY_PROFIT_TAKE_USDT:
+                print(f"💰 Cierre temprano (Haack) {symbol}: uPnL={upnl:+.2f} USDT >= {EARLY_PROFIT_TAKE_USDT:.2f}")
+                closed = trader.close_position(symbol)
+                if closed:
+                    try:
+                        trader.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    try:
+                        trade_id = trade.get('id')
+                        if trade_id is not None:
+                            db.close_trade(int(trade_id), exit_price=current_price, exit_reason="EARLY_TP_UPNL")
+                    except Exception as e:
+                        print(f"⚠️ No se pudo cerrar trade en DB para {symbol}: {e}")
+                    send_telegram(
+                        f"💰 <b>CIERRE TEMPRANO</b>\n"
+                        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                        f"📌 Par: {display_symbol(symbol)} {side}\n"
+                        f"📈 PnL: <b>{upnl:+.2f} USDT</b>\n"
+                        f"🚪 Precio salida: {current_price:.6f}"
+                    )
+                continue
+
+            # Reponer protecciones si faltan en exchange
+            if (current_sl is None or len(pos.get('takeProfits') or []) == 0) and trader.reconciler is not None:
+                try:
+                    tp_prices = trade.get('tp_prices') or []
+                    sl_db = float(trade.get('sl_price')) if trade.get('sl_price') is not None else None
+                    if sl_db is not None and len(tp_prices) > 0 and qty > 0:
+                        sl_order, tp_orders = trader.reconciler.ensure_orders_exist(
+                            symbol=symbol,
+                            side=side,
+                            quantity=qty,
+                            sl_price=sl_db,
+                            tp_prices=tp_prices,
+                            max_retries=2,
+                        )
+                        if sl_order or tp_orders:
+                            print(f"🛡️ Reconciliación de salida (Haack) {symbol}: SL={bool(sl_order)} TPs={len(tp_orders)}")
+                except Exception as e:
+                    print(f"⚠️ No se pudieron reponer SL/TP en {symbol}: {e}")
+
+            current_sl = pos.get('stopLoss')
+            if current_sl is None:
+                continue
+            current_sl = float(current_sl)
+
+            candidates = []
+
+            if BREAKEVEN_ON_TP1:
+                tp_prices = trade.get('tp_prices') or []
+                tp1 = float(tp_prices[0]) if tp_prices else None
+                if tp1:
+                    if side == "LONG" and current_price >= tp1:
+                        be_sl = entry * (1 + BREAKEVEN_OFFSET_PCT / 100.0)
+                        candidates.append(be_sl)
+                    elif side == "SHORT" and current_price <= tp1:
+                        be_sl = entry * (1 - BREAKEVEN_OFFSET_PCT / 100.0)
+                        candidates.append(be_sl)
+
+            if TRAILING_ATR_ENABLED:
+                tf = TRAILING_ATR_TIMEFRAME or (trade.get('timeframe') or '4h')
+                df = get_klines(symbol, tf, limit=max(ATR_PERIOD + 30, 140))
+                if df is not None and not df.empty and len(df) > ATR_PERIOD + 2:
+                    atr_series = ta.atr(df["high"], df["low"], df["close"], length=ATR_PERIOD)
+                    atr = float(atr_series.iloc[-1])
+                    if atr > 0:
+                        if side == "LONG":
+                            trail_sl = current_price - (TRAILING_ATR_MULT * atr)
+                        else:
+                            trail_sl = current_price + (TRAILING_ATR_MULT * atr)
+                        candidates.append(trail_sl)
+
+            if not candidates:
+                continue
+
+            if side == "LONG":
+                target_sl = max([current_sl] + candidates)
+                better = target_sl > current_sl
+                valid_side = target_sl < current_price
+            else:
+                target_sl = min([current_sl] + candidates)
+                better = target_sl < current_sl
+                valid_side = target_sl > current_price
+
+            if not better or not valid_side:
+                continue
+
+            move_pct = abs(target_sl - current_sl) / entry if entry > 0 else 0.0
+            if move_pct < MIN_SL_MOVE_PERCENT:
+                continue
+
+            updated = trader.update_stop_loss(symbol=symbol, side=side, new_sl_price=target_sl)
+            if updated:
+                print(f"🛡️ SL dinámico (Haack) {symbol}: {current_sl:.6f} -> {target_sl:.6f}")
+
+    except Exception as e:
+        print(f"⚠️ Error en gestión dinámica de SL (Haack): {e}")
+
+
 def main():
     """Loop de escaneo con UI estilo conservador."""
+    global AUTO_TRADE_ENABLED
     print("🤖 Bot EMA+Ichimoku Scanner HAACK + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
     print(f"📊 Base de datos: trading_history.db")
+    print(f"🛡️ Risk Profile: {RISK_PROFILE_SNAPSHOT['RISK_PROFILE_SELECTED']} ({RISK_PROFILE_SNAPSHOT['RISK_ENV_MODE']})")
+    print(f"   • MAX_DAILY_LOSS_USDT={RISK_PROFILE_SNAPSHOT['MAX_DAILY_LOSS_USDT']} | MAX_CONSECUTIVE_LOSSES={RISK_PROFILE_SNAPSHOT['MAX_CONSECUTIVE_LOSSES']}")
+    print(f"   • MAX_DRAWDOWN_PCT={RISK_PROFILE_SNAPSHOT['MAX_DRAWDOWN_PCT']} | PAUSE_MIN={RISK_PROFILE_SNAPSHOT['RISK_GUARD_PAUSE_MINUTES']}")
 
     if AUTO_TRADE_ENABLED:
         print("🤖 TRADING AUTOMÁTICO ACTIVADO")
@@ -1225,6 +1650,8 @@ def main():
     print(f"   ✅ Ichimoku: Tenkan/Kijun/Kumo/Chikou (params {ICHI_TENKAN},{ICHI_KIJUN},{ICHI_SENKOUB})")
     print(f"   ✅ Score mínimo híbrido: {MIN_SCORE_TO_TRADE:.2f}")
     print(f"   ⚡ Impulsos activos en: {', '.join(IMPULSE_TFS)} | cuerpo>={int(IMPULSE_MIN_BODY_PCT*100)}% & cuerpo>= {IMPULSE_BODY_ATR_MULT}x ATR & vol>={IMPULSE_MIN_VOL_RATIO}x")
+    print(f"   ✅ SL dinámico: {'ON' if DYNAMIC_SL_ENABLED else 'OFF'} | Breakeven TP1: {'ON' if BREAKEVEN_ON_TP1 else 'OFF'} | Trail ATR: {'ON' if TRAILING_ATR_ENABLED else 'OFF'} ({TRAILING_ATR_MULT}x)")
+    print(f"   ✅ Cierre temprano por PnL: {'ON' if EARLY_PROFIT_TAKE_ENABLED else 'OFF'} | Umbral: {EARLY_PROFIT_TAKE_USDT:.2f} USDT")
 
     minutes = max(1, int(SCAN_INTERVAL_SECONDS / 60))
     print(f"\n🔄 Escaneando cada {minutes} minutos...\n")
@@ -1232,10 +1659,18 @@ def main():
     # Mensaje inicial a Telegram
     tf_list = ", ".join(TIMEFRAME_NAMES.values())
     mode = "🤖 TRADING AUTOMÁTICO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS"
-    send_telegram(f"""🤖 <b>Bot EMA+Ichimoku HAACK Iniciado</b>\n\n{mode}\n📊 {len(WATCHLIST)} cryptos\n⏰ Timeframes: {tf_list}\n🔄 Escaneo cada {minutes} min\n\n🛡️ Filtros activos + scoring híbrido""")
+    send_telegram(
+        f"🚀 <b>BOT INICIADO</b>\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+        f"{mode}\n"
+        f"📊 Activos: {len(WATCHLIST)}\n"
+        f"⏰ Timeframes: {tf_list}\n"
+        f"🔄 Escaneo: cada {minutes} min"
+    )
 
     # Inicializar componentes
     db = TradingDatabase("trading_history.db")
+    risk_guard = RiskGuard(db, BOT_NAME)
     trader: Optional[BinanceFuturesTrader] = None
     if AUTO_TRADE_ENABLED:
         try:
@@ -1248,29 +1683,43 @@ def main():
         except Exception as e:
             print(f"⚠️ No se pudo iniciar trader (modo alerta): {e}")
             trader = None
+            AUTO_TRADE_ENABLED = False
+            print("📢 Auto-trading desactivado por falla de autenticación. El bot continuará solo con alertas.")
 
     # Loop de escaneo
     while True:
         try:
             # Mostrar posiciones antes del escaneo
             show_positions_summary(trader)
+            manage_dynamic_stop_losses(trader, db)
+            reconcile_closed_trades_and_notify(trader, db)
 
             # Escanear
-            scan_once(trader, db)
+            scan_once(trader, db, risk_guard=risk_guard)
 
             # Mostrar posiciones después del escaneo
             show_positions_summary(trader)
+            manage_dynamic_stop_losses(trader, db)
+            reconcile_closed_trades_and_notify(trader, db)
 
             print(f"\n⏳ Esperando {minutes} minutos hasta el próximo escaneo...")
             time.sleep(SCAN_INTERVAL_SECONDS)
 
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
-            send_telegram("⚠️ Bot EMA+Ichimoku HAACK detenido")
+            send_telegram(
+                f"⚠️ <b>BOT DETENIDO</b>\n"
+                f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                f"🛑 Detenido por usuario"
+            )
             break
         except Exception as e:
             print(f"\n❌ Error crítico: {e}")
-            send_telegram(f"❌ Bot error: {e}")
+            send_telegram(
+                f"❌ <b>BOT ERROR</b>\n"
+                f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                f"⚠️ Detalle: {e}"
+            )
             print("⏳ Reintentando en 5 minutos...")
             time.sleep(300)
 

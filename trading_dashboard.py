@@ -9,6 +9,7 @@ import pandas as pd
 from trading_database import TradingDatabase
 from typing import Optional
 import os
+import math
 
 class TradingDashboard:
     def __init__(self, db_path: str = "trading_history.db"):
@@ -24,6 +25,14 @@ class TradingDashboard:
         }
         # Filtro actual de bot para gráficos (None = todos)
         self._filter_bot = None
+
+    @staticmethod
+    def _finite(value, default: float = 0.0) -> float:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return default
+        return num if math.isfinite(num) else default
     
     def generate_full_report(self, output_dir: str = "reports", bot: Optional[str] = None):
         """Genera un reporte completo con todos los gráficos.
@@ -241,7 +250,7 @@ Trade #{i}:
             ax.set_title('Distribución de PnL')
             return
         
-        pnls = [t['pnl'] for t in trades]
+        pnls = [self._finite(t.get('pnl')) for t in trades]
         colors = [self.colors['profit'] if p > 0 else self.colors['loss'] for p in pnls]
         
         ax.bar(range(len(pnls)), pnls, color=colors, alpha=0.7)
@@ -262,7 +271,14 @@ Trade #{i}:
             ax.set_title('Win Rate')
             return
         
-        sizes = [stats['winning_trades'], stats['losing_trades']]
+        wins = int(self._finite(stats.get('winning_trades'), 0))
+        losses = int(self._finite(stats.get('losing_trades'), 0))
+        sizes = [wins, losses]
+        if sum(sizes) == 0:
+            ax.text(0.5, 0.5, 'Solo trades breakeven', ha='center', va='center', 
+                   transform=ax.transAxes)
+            ax.set_title('Win Rate')
+            return
         labels = [f"Ganados\n{stats['winning_trades']}", 
                  f"Perdidos\n{stats['losing_trades']}"]
         colors = [self.colors['profit'], self.colors['loss']]
@@ -292,7 +308,7 @@ Trade #{i}:
         for trade in trades:
             symbol = trade['symbol']
             symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
-            symbol_pnl[symbol] = symbol_pnl.get(symbol, 0) + trade['pnl']
+            symbol_pnl[symbol] = symbol_pnl.get(symbol, 0) + self._finite(trade.get('pnl'))
         
         # Top 10 símbolos
         top_symbols = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -322,7 +338,7 @@ Trade #{i}:
         
         for trade in trades:
             tf = trade.get('timeframe', 'N/A')
-            timeframe_pnl[tf] = timeframe_pnl.get(tf, 0) + trade['pnl']
+            timeframe_pnl[tf] = timeframe_pnl.get(tf, 0) + self._finite(trade.get('pnl'))
             timeframe_count[tf] = timeframe_count.get(tf, 0) + 1
         
         timeframes = list(timeframe_pnl.keys())
@@ -357,10 +373,17 @@ Trade #{i}:
         durations = []
         for trade in trades:
             if trade['entry_time'] and trade['exit_time']:
-                entry = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S.%f')
-                exit = datetime.strptime(trade['exit_time'], '%Y-%m-%d %H:%M:%S.%f')
+                try:
+                    entry = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S.%f')
+                except ValueError:
+                    entry = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
+                try:
+                    exit = datetime.strptime(trade['exit_time'], '%Y-%m-%d %H:%M:%S.%f')
+                except ValueError:
+                    exit = datetime.strptime(trade['exit_time'], '%Y-%m-%d %H:%M:%S')
                 duration_hours = (exit - entry).total_seconds() / 3600
-                durations.append(duration_hours)
+                if math.isfinite(duration_hours) and duration_hours >= 0:
+                    durations.append(duration_hours)
         
         if durations:
             ax.hist(durations, bins=20, color=self.colors['neutral'], alpha=0.7, edgecolor='black')

@@ -13,9 +13,13 @@ import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
+from risk_guard import RiskGuard
+from risk_profiles import apply_risk_profile_defaults
+from bot_watchlists import SWING_WATCHLIST
 
 # ================== CONFIG ==================
 load_dotenv()
+RISK_PROFILE_SNAPSHOT = apply_risk_profile_defaults()
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -26,6 +30,7 @@ if not TOKEN or not CHAT_ID:
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+BOT_NAME = "Swing"
 
 # Timeframes Swing
 TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
@@ -41,22 +46,7 @@ TIMEFRAME_NAMES = {
 client = Client()
 
 # Cryptos a monitorear (formato Binance sin /)
-WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "LTCUSDT", "TRXUSDT", "BCHUSDT", "UNIUSDT", "NEARUSDT",
-    "FILUSDT", "ETCUSDT", "OPUSDT", "ARBUSDT", "ATOMUSDT",
-    "HBARUSDT", "VETUSDT", "SUIUSDT", "APTUSDT", "GRTUSDT",
-    "AAVEUSDT", "GALAUSDT", "MINAUSDT", "THETAUSDT", "FLOWUSDT",
-    "EGLDUSDT", "AXSUSDT", "IMXUSDT", "SANDUSDT", "MANAUSDT",
-    "ENJUSDT", "APEUSDT", "QNTUSDT", "DASHUSDT", "COMPUSDT",
-    "ONEUSDT", "CHZUSDT", "INJUSDT", "DYDXUSDT", "STXUSDT",
-    "CRVUSDT", "KAVAUSDT", "TWTUSDT", "CAKEUSDT", "FXSUSDT",
-    "GMXUSDT", "WOOUSDT", "ROSEUSDT", "KDAUSDT", "ZILUSDT",
-    "RVNUSDT", "SSVUSDT", "ALGOUSDT", "CELOUSDT", "YFIUSDT",
-    "BAKEUSDT", "GTCUSDT", "HIGHUSDT", "IOSTUSDT", "KNCUSDT",
-    "LRCUSDT", "MTLUSDT", "OGNUSDT", "ONTUSDT", "STORJUSDT",
-]
+WATCHLIST = list(SWING_WATCHLIST)
 
 # 🧭 PRESET SWING — filtros y gestión
 REQUIRE_EMA200_TREND = True
@@ -93,16 +83,17 @@ REQUIRE_CLOSE_IN_DIRECTION = True
 STRUCT_REQUIRE_HH_HL = True
 STRUCT_SWING_DEPTH = 3
 ADX_FILTER = True
-ADX_MIN = 18
+ADX_MIN = 16
 MIN_BODY_TO_RANGE = 0.50
 MAX_UPWICK_FOR_LONG = 0.40
 MAX_DOWNWICK_FOR_SHORT = 0.40
 
 TIMEFRAME_ALIGNMENT = True
-ALIGN_WITH = ["4h","12h"]
+ALIGN_WITH = ["4h"]
 MIN_TICKS_SINCE_SIGNAL = 2
 BLOCK_NEWS_SPIKES = True
 ALLOW_SESSION = ["UTC_00_24"]
+ALLOW_CONTINUATION_SIGNALS = True
 
 USE_FUNDING_BIAS = True
 MAX_POSITIVE_FUNDING = 0.05
@@ -119,10 +110,10 @@ SCORE_WEIGHTS = {
     "structure_HH_HL": 1.2,
     "adx": 1.0,
 }
-MIN_SCORE_TO_TRADE = 4.2
+MIN_SCORE_TO_TRADE = 3.8
 
 MAX_CONCURRENT_POS = 3
-COOLDOWN_AFTER_TRADE_MIN = 30
+COOLDOWN_AFTER_TRADE_MIN = 20
 MAX_TRADES_PER_DAY = 10
 POSITION_SIZE_MULT = 1.0
 LEVERAGE_CAP = 5
@@ -133,14 +124,32 @@ PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
 SWING_LOOKBACK = 10
 SL_ATR_BUFFER = 0.2
 TP_MULTS = [1.5, 2.5, 3.5]
+
+# Gestión dinámica de Stop Loss (post-entrada)
+DYNAMIC_SL_ENABLED = os.getenv("DYNAMIC_SL_ENABLED", "True").lower() == "true"
+BREAKEVEN_ON_TP1 = os.getenv("BREAKEVEN_ON_TP1", "True").lower() == "true"
+BREAKEVEN_OFFSET_PCT = float(os.getenv("BREAKEVEN_OFFSET_PCT", "0.0"))
+TRAILING_ATR_ENABLED = os.getenv("TRAILING_ATR_ENABLED", "True").lower() == "true"
+TRAILING_ATR_MULT = float(os.getenv("TRAILING_ATR_MULT", "1.0"))
+TRAILING_ATR_TIMEFRAME = os.getenv("TRAILING_ATR_TIMEFRAME", "")
+MIN_SL_MOVE_PERCENT = float(os.getenv("MIN_SL_MOVE_PERCENT", "0.001"))
+EARLY_PROFIT_TAKE_ENABLED = os.getenv("SWING_EARLY_PROFIT_TAKE_ENABLED", os.getenv("EARLY_PROFIT_TAKE_ENABLED", "True")).lower() == "true"
+EARLY_PROFIT_TAKE_USDT = float(os.getenv("SWING_EARLY_PROFIT_TAKE_USDT", os.getenv("EARLY_PROFIT_TAKE_USDT", "12.0")))
+
+# Límites de margen (USDT real invertido) por trade
+MIN_MARGIN_USDT = float(os.getenv("SWING_MIN_MARGIN_USDT", os.getenv("MIN_MARGIN_USDT", "25.0")))
+MAX_MARGIN_USDT = float(os.getenv("SWING_MAX_MARGIN_USDT", os.getenv("MAX_MARGIN_USDT", "50.0")))
 # ============================================
 
 # Estado runtime para cooldown y límites diarios
 _last_trade_time = {}
 _daily_trade_count = {}
+_trade_wallet_baseline = {}
+_last_wallet_balance_snapshot = None
 
 # Inicializar base de datos
 db = TradingDatabase("trading_history.db")
+risk_guard = RiskGuard(db, BOT_NAME)
 
 # Inicializar trader
 trader = None
@@ -193,6 +202,197 @@ def send_telegram(message: str):
             print(f"⚠️ Error Telegram: {r.status_code}")
     except Exception as e:
         print(f"[WARN] Telegram falló: {e}")
+
+def get_wallet_balance_usdt():
+    """Obtiene wallet balance (USDT) para reportes de cierre."""
+    if not AUTO_TRADE_ENABLED or trader is None:
+        return None
+    try:
+        account = trader.client.futures_account(recvWindow=60000)
+        for asset in account.get('assets', []):
+            if asset.get('asset') == 'USDT':
+                return float(asset.get('walletBalance', 0))
+    except Exception as e:
+        print(f"⚠️ No se pudo leer walletBalance: {e}")
+
+    try:
+        return float(trader.get_account_balance())
+    except Exception:
+        return None
+
+def _to_millis(dt_value):
+    if dt_value is None:
+        return 0
+    try:
+        s = str(dt_value).strip()
+        if not s:
+            return 0
+        parsed = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        return int(parsed.timestamp() * 1000)
+    except Exception:
+        return 0
+
+def detect_close_reason_and_price(symbol: str, trade: dict):
+    """Detecta si el cierre fue por TP o SL y obtiene precio de salida desde Binance."""
+    reason = "CLOSE"
+    exit_price = 0.0
+
+    if not AUTO_TRADE_ENABLED or trader is None:
+        return reason, exit_price
+
+    try:
+        entry_ms = _to_millis(trade.get('entry_time'))
+        orders = trader.client.futures_get_all_orders(symbol=symbol, limit=120)
+        close_candidates = []
+
+        for order in orders:
+            if order.get('status') != 'FILLED':
+                continue
+
+            order_type = str(order.get('type', ''))
+            if order_type not in ['STOP_MARKET', 'STOP', 'TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'MARKET']:
+                continue
+
+            update_ms = int(order.get('updateTime') or order.get('time') or 0)
+            if entry_ms and update_ms and update_ms < entry_ms:
+                continue
+
+            if order_type == 'MARKET':
+                reduce_only = str(order.get('reduceOnly', '')).lower() == 'true'
+                close_position = str(order.get('closePosition', '')).lower() == 'true'
+                if not reduce_only and not close_position:
+                    continue
+
+            close_candidates.append(order)
+
+        if close_candidates:
+            last_order = max(close_candidates, key=lambda x: int(x.get('updateTime') or x.get('time') or 0))
+            order_type = str(last_order.get('type', ''))
+
+            if 'TAKE_PROFIT' in order_type:
+                reason = 'TP'
+            elif 'STOP' in order_type:
+                reason = 'SL'
+            else:
+                reason = 'CLOSE'
+
+            # Calcular precio de salida promedio ponderado por cantidad
+            total_qty = 0.0
+            weighted_price = 0.0
+            for c in close_candidates:
+                avg_p = float(c.get('avgPrice') or 0)
+                exec_qty = float(c.get('executedQty') or 0)
+                if avg_p > 0 and exec_qty > 0:
+                    weighted_price += avg_p * exec_qty
+                    total_qty += exec_qty
+            
+            if total_qty > 0 and weighted_price > 0:
+                exit_price = weighted_price / total_qty
+            else:
+                exit_price = float(last_order.get('avgPrice') or 0)
+                if exit_price <= 0:
+                    exit_price = float(last_order.get('stopPrice') or last_order.get('price') or 0)
+    except Exception as e:
+        print(f"⚠️ No se pudo detectar motivo de cierre en {symbol}: {e}")
+
+    return reason, exit_price
+
+def send_close_summary_telegram(trade: dict, close_reason: str, exit_price: float, wallet_before, wallet_after):
+    """Envía resumen completo de cierre al Telegram."""
+    symbol = trade.get('symbol', '')
+    side = trade.get('side', '')
+    entry_price = float(trade.get('entry_price') or 0)
+    quantity = float(trade.get('quantity') or 0)
+    leverage = int(trade.get('leverage') or 1)
+
+    notional = entry_price * quantity
+    margin_used = notional / leverage if leverage > 0 else notional
+
+    if side == 'LONG':
+        pnl = (exit_price - entry_price) * quantity
+    else:
+        pnl = (entry_price - exit_price) * quantity
+
+    pnl_pct = ((pnl / margin_used) * 100) if margin_used > 0 else 0.0
+    wallet_delta = None
+    if wallet_before is not None and wallet_after is not None:
+        wallet_delta = float(wallet_after) - float(wallet_before)
+
+    reason_emoji = '🟢 TP' if close_reason == 'TP' else ('🔴 SL' if close_reason == 'SL' else '⚪ CIERRE')
+    result_emoji = '📈' if pnl >= 0 else '📉'
+
+    message = (
+        f"✅ <b>OPERACIÓN CERRADA</b>\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+        f"📌 Par: {display_symbol(symbol)} {side}\n"
+        f"🏁 Motivo: <b>{reason_emoji}</b>\n\n"
+        f"💵 Invertido (margen): {margin_used:.2f} USDT\n"
+        f"📦 Notional: {notional:.2f} USDT (x{leverage})\n"
+        f"🎯 Entrada: {entry_price:.6f}\n"
+        f"🚪 Salida: {exit_price:.6f}\n\n"
+        f"{result_emoji} Resultado: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
+    )
+
+    if wallet_before is not None:
+        message += f"💰 Wallet anterior: {float(wallet_before):.2f} USDT\n"
+    if wallet_after is not None:
+        message += f"🏦 Wallet final: {float(wallet_after):.2f} USDT\n"
+    if wallet_delta is not None:
+        message += f"📊 Cambio wallet: <b>{wallet_delta:+.2f} USDT</b>\n"
+
+    send_telegram(message)
+
+def reconcile_closed_trades_and_notify():
+    """Sincroniza cierres SL/TP con DB y envía resumen de cierre por Telegram."""
+    global _last_wallet_balance_snapshot
+
+    if not AUTO_TRADE_ENABLED or trader is None:
+        return
+
+    try:
+        positions = trader.get_open_positions()
+        open_symbols = {p['symbol'] for p in positions}
+
+        open_trades = [
+            t for t in db.get_open_trades()
+            if str(t.get('bot') or '').lower() == BOT_NAME.lower()
+        ]
+
+        for trade in open_trades:
+            symbol = trade.get('symbol')
+            if symbol in open_symbols:
+                continue
+
+            trade_id = int(trade.get('id'))
+            close_reason, exit_price = detect_close_reason_and_price(symbol, trade)
+
+            if exit_price <= 0:
+                try:
+                    ticker = client.get_symbol_ticker(symbol=symbol)
+                    exit_price = float(ticker['price'])
+                except Exception:
+                    exit_price = float(trade.get('entry_price') or 0)
+
+            db_exit_reason = 'TAKE_PROFIT' if close_reason == 'TP' else ('STOP_LOSS' if close_reason == 'SL' else 'SYNC_CLOSE')
+            db.close_trade(trade_id, exit_price=exit_price, exit_reason=db_exit_reason)
+
+            wallet_before = _trade_wallet_baseline.pop(trade_id, None)
+            if wallet_before is None:
+                wallet_before = _last_wallet_balance_snapshot
+            wallet_after = get_wallet_balance_usdt()
+
+            send_close_summary_telegram(
+                trade=trade,
+                close_reason=close_reason,
+                exit_price=exit_price,
+                wallet_before=wallet_before,
+                wallet_after=wallet_after
+            )
+
+            if wallet_after is not None:
+                _last_wallet_balance_snapshot = wallet_after
+    except Exception as e:
+        print(f"⚠️ Error reconciliando cierres Swing: {e}")
 
 def decimals_for(symbol: str) -> int:
     if symbol.endswith("USDT"):
@@ -258,15 +458,22 @@ def fib_levels_from_swing(df: pd.DataFrame, lookback: int, side: str):
     return levels
 
 def nearest_sr(df: pd.DataFrame, lookback: int):
-    w = df.tail(lookback)
-    highs = w["high"].rolling(3).apply(lambda x: float(x[1] > x[0] and x[1] > x[2]))
-    lows = w["low"].rolling(3).apply(lambda x: float(x[1] < x[0] and x[1] < x[2]))
+    w = df.tail(lookback).copy()
+    if len(w) < 3:
+        return []
+    highs = w["high"].rolling(3, min_periods=3, center=True).apply(
+        lambda x: float(x[1] > x[0] and x[1] > x[2]), raw=True
+    )
+    lows = w["low"].rolling(3, min_periods=3, center=True).apply(
+        lambda x: float(x[1] < x[0] and x[1] < x[2]), raw=True
+    )
     levels = []
-    for i in range(2, len(w)):
-        if highs.iloc[i] == 1.0:
-            levels.append(float(w["high"].iloc[i]))
-        if lows.iloc[i] == 1.0:
-            levels.append(float(w["low"].iloc[i]))
+    for i in range(len(w)):
+        if 1 <= i <= len(w) - 2:
+            if highs.iloc[i] == 1.0:
+                levels.append(float(w["high"].iloc[i]))
+            if lows.iloc[i] == 1.0:
+                levels.append(float(w["low"].iloc[i]))
     levels = sorted(list(set(round(v, 6) for v in levels)))
     return levels[-30:]
 
@@ -499,10 +706,10 @@ def build_levels(side: str, last_row, df, symbol: str, timeframe: str):
     # SL/TP basados en ATR y preset
     if side == "LONG":
         sl = price - SL_ATR_MULT * atr
-        tps = [price + TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+        tps = [price + TP_ATR_MULT * atr * m for m in [0.6, 0.8, 1.0]]
     else:
         sl = price + SL_ATR_MULT * atr
-        tps = [price - TP_ATR_MULT * atr * m for m in [1.0, 0.8, 0.6]]
+        tps = [price - TP_ATR_MULT * atr * m for m in [0.6, 0.8, 1.0]]
 
     vol_now = float(df["volume"].iloc[-1])
     vol_avg20 = float(df["volume"].tail(20).mean())
@@ -542,7 +749,7 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
     dec = levels['decimals']
     fmt = f"{{:.{dec}f}}"
     
-    status = "🚀 <b>TRADE SWING EJECUTADO</b>" if traded else "📣 <b>SEÑAL SWING</b>"
+    status = "🚀 <b>TRADE EJECUTADO</b>" if traded else "📣 <b>SEÑAL DETECTADA</b>"
     
     entry_str = f"{fmt.format(levels['entry_high'])} - {fmt.format(levels['entry_low'])}"
     tp_lines = "\n".join([f"🟢 TP{i+1}: {fmt.format(t)}" if side == "LONG"
@@ -550,18 +757,16 @@ def format_trade_message(symbol: str, side: str, levels: dict, timeframe: str,
                           for i, t in enumerate(levels['tp_prices'])])
     
     message = f"""{status}
-<b>{sy}</b> {'🟢 LONG' if side=='LONG' else '🔴 SHORT'}
+🤖 Bot: <b>{BOT_NAME}</b>
+📌 Par: <b>{sy}</b> {'🟢 LONG' if side=='LONG' else '🔴 SHORT'}
 ⏰ Timeframe: {tf_name}
 
-📍 Zona de Entrada: {entry_str}
-
+📍 Zona entrada: {entry_str}
+🔴 SL: {fmt.format(levels['sl_price'])}
 {tp_lines}
 
-🔴 SL: {fmt.format(levels['sl_price'])}
-
-💰 Precio Actual: {fmt.format(levels['price'])}
+💰 Precio actual: {fmt.format(levels['price'])}
 📊 Vol Ratio: {levels['vol_ratio']:.2f}x
-
 💡 {levels['vol_hint']}"""
     
     # Agregar info de filtros si está disponible
@@ -578,6 +783,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         return False
     
     try:
+        wallet_before_trade = get_wallet_balance_usdt()
+
         # Cooldown y límites
         key = f"{symbol}:{timeframe}"
         now = time.time()
@@ -589,6 +796,11 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         cnt = _daily_trade_count.get(day, 0)
         if cnt >= MAX_TRADES_PER_DAY:
             print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
+            return False
+
+        can_trade, reason = risk_guard.can_open_trade(symbol=symbol)
+        if not can_trade:
+            print(f"🛑 RiskGuard bloqueó trade en {symbol}: {reason}")
             return False
 
         # Verificar número de posiciones abiertas
@@ -612,7 +824,9 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
             entry_price=levels['entry_price'],
             sl_price=levels['sl_price'],
             tp_prices=levels['tp_prices'],
-            force_market=USE_MARKET_ORDER
+            force_market=USE_MARKET_ORDER,
+            min_margin_usdt=MIN_MARGIN_USDT,
+            max_margin_usdt=MAX_MARGIN_USDT,
         )
         
         if result:
@@ -630,49 +844,56 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     tp_prices=result['tp_prices'],
                     timeframe=timeframe,
                     notes=f"Señal EMA Swing - {timeframe}",
-                    bot="Swing"
+                    bot=BOT_NAME
                 )
+                print(f"✅ Trade registrado: ID={trade_id}, {symbol} {side} @ {result['entry_price']}")
                 
-                # Registrar órdenes individuales
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['entry_order']['orderId']),
-                    order_type="ENTRY",
-                    side=result['entry_order']['side'],
-                    symbol=symbol,
-                    price=result['entry_price'],
-                    quantity=result['quantity'],
-                    status="FILLED"
-                )
-                
-                db.add_order(
-                    trade_id=trade_id,
-                    order_id=str(result['sl_order']['orderId']),
-                    order_type="STOP_LOSS",
-                    side=result['sl_order']['side'],
-                    symbol=symbol,
-                    price=result['sl_price'],
-                    quantity=result['quantity'],
-                    status="NEW"
-                )
-                
-                for i, tp_order in enumerate(result['tp_orders'], 1):
-                    db.add_order(
-                        trade_id=trade_id,
-                        order_id=str(tp_order['orderId']),
-                        order_type=f"TAKE_PROFIT_{i}",
-                        side=tp_order['side'],
-                        symbol=symbol,
-                        price=tp_order['stopPrice'],
-                        quantity=tp_order['origQty'],
-                        status="NEW"
-                    )
-                
-                print(f"📊 Trade registrado en DB: ID={trade_id}")
+                # Guardar wallet baseline ANTES de registrar órdenes
+                if wallet_before_trade is not None:
+                    _trade_wallet_baseline[int(trade_id)] = float(wallet_before_trade)
                 _last_trade_time[key] = now
                 _daily_trade_count[day] = cnt + 1
+                
+                # Registrar órdenes individuales (no crítico)
+                try:
+                    db.add_order(
+                        trade_id=trade_id,
+                        order_id=str(result['entry_order'].get('orderId', 'N/A')),
+                        order_type="ENTRY",
+                        side=result['entry_order'].get('side', side),
+                        symbol=symbol,
+                        price=result['entry_price'],
+                        quantity=result['quantity'],
+                        status="FILLED"
+                    )
+                    
+                    if result.get('sl_order'):
+                        db.add_order(
+                            trade_id=trade_id,
+                            order_id=str(result['sl_order'].get('orderId', 'N/A')),
+                            order_type="STOP_LOSS",
+                            side=result['sl_order'].get('side', 'SELL' if side == 'LONG' else 'BUY'),
+                            symbol=symbol,
+                            price=result['sl_price'],
+                            quantity=result['quantity'],
+                            status="NEW"
+                        )
+                    
+                    for i, tp_order in enumerate(result['tp_orders'], 1):
+                        db.add_order(
+                            trade_id=trade_id,
+                            order_id=str(tp_order.get('orderId', 'N/A')),
+                            order_type=f"TAKE_PROFIT_{i}",
+                            side=tp_order.get('side', 'SELL' if side == 'LONG' else 'BUY'),
+                            symbol=symbol,
+                            price=tp_order.get('stopPrice', tp_order.get('price', 0)),
+                            quantity=tp_order.get('origQty', result['quantity']),
+                            status="NEW"
+                        )
+                except Exception as e:
+                    print(f"⚠️ Error al registrar órdenes individuales en DB: {e}")
             except Exception as e:
-                print(f"⚠️ Error al registrar en DB: {e}")
+                print(f"⚠️ Error al registrar trade en DB: {e}")
             
             return True
         else:
@@ -704,6 +925,18 @@ def analyze(symbol, timeframe):
     elif prev["EMA20"] > prev["EMA50"] and last["EMA20"] < last["EMA50"]:
         signal = "SELL"
         side = "SHORT"
+
+    # Fallback de continuación de tendencia (más activo que cruce puro)
+    if signal == "HOLD" and ALLOW_CONTINUATION_SIGNALS:
+        ema20_now = float(last["EMA20"])
+        ema50_now = float(last["EMA50"])
+        close_now = float(last["close"])
+        if ema20_now > ema50_now and close_now >= ema20_now:
+            signal = "BUY"
+            side = "LONG"
+        elif ema20_now < ema50_now and close_now <= ema20_now:
+            signal = "SELL"
+            side = "SHORT"
 
     if signal in ("BUY", "SELL"):
         # Alineación multi-TF
@@ -852,12 +1085,145 @@ def show_positions_summary():
         
         print(f"\n  💰 PnL Total: {total_pnl:+.2f} USDT\n")
 
+def manage_dynamic_stop_losses():
+    """Mueve el SL a breakeven y/o trailing ATR sin empeorar riesgo."""
+    if not AUTO_TRADE_ENABLED or trader is None or not DYNAMIC_SL_ENABLED:
+        return
+
+    try:
+        positions = trader.get_open_positions()
+        if not positions:
+            return
+
+        open_trades = [
+            t for t in db.get_open_trades()
+            if str(t.get('bot') or '').lower() == BOT_NAME.lower()
+        ]
+        trade_by_symbol = {t['symbol']: t for t in open_trades}
+
+        for pos in positions:
+            symbol = pos['symbol']
+            side = pos['side']
+            qty = float(pos.get('quantity', 0))
+            entry = float(pos['entryPrice'])
+            upnl = float(pos.get('unrealizedProfit', 0))
+            current_sl = pos.get('stopLoss')
+
+            trade = trade_by_symbol.get(symbol)
+            if not trade:
+                continue
+
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+
+            if EARLY_PROFIT_TAKE_ENABLED and upnl >= EARLY_PROFIT_TAKE_USDT:
+                print(f"💰 Cierre temprano (Swing) {symbol}: uPnL={upnl:+.2f} USDT >= {EARLY_PROFIT_TAKE_USDT:.2f}")
+                closed = trader.close_position(symbol)
+                if closed:
+                    try:
+                        trader.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    try:
+                        trade_id = trade.get('id')
+                        if trade_id is not None:
+                            db.close_trade(int(trade_id), exit_price=current_price, exit_reason="EARLY_TP_UPNL")
+                    except Exception as e:
+                        print(f"⚠️ No se pudo cerrar trade en DB para {symbol}: {e}")
+                    send_telegram(
+                        f"💰 <b>CIERRE TEMPRANO</b>\n"
+                        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                        f"📌 Par: {display_symbol(symbol)} {side}\n"
+                        f"📈 PnL: <b>{upnl:+.2f} USDT</b>\n"
+                        f"🚪 Precio salida: {current_price:.6f}"
+                    )
+                continue
+
+            # Reponer protecciones si faltan en exchange
+            if (current_sl is None or len(pos.get('takeProfits') or []) == 0) and trader.reconciler is not None:
+                try:
+                    tp_prices = trade.get('tp_prices') or []
+                    sl_db = float(trade.get('sl_price')) if trade.get('sl_price') is not None else None
+                    if sl_db is not None and len(tp_prices) > 0 and qty > 0:
+                        sl_order, tp_orders = trader.reconciler.ensure_orders_exist(
+                            symbol=symbol,
+                            side=side,
+                            quantity=qty,
+                            sl_price=sl_db,
+                            tp_prices=tp_prices,
+                            max_retries=2,
+                        )
+                        if sl_order or tp_orders:
+                            print(f"🛡️ Reconciliación de salida (Swing) {symbol}: SL={bool(sl_order)} TPs={len(tp_orders)}")
+                except Exception as e:
+                    print(f"⚠️ No se pudieron reponer SL/TP en {symbol}: {e}")
+
+            current_sl = pos.get('stopLoss')
+            if current_sl is None:
+                continue
+            current_sl = float(current_sl)
+
+            candidates = []
+
+            if BREAKEVEN_ON_TP1:
+                tp_prices = trade.get('tp_prices') or []
+                tp1 = float(tp_prices[0]) if tp_prices else None
+                if tp1:
+                    if side == "LONG" and current_price >= tp1:
+                        be_sl = entry * (1 + BREAKEVEN_OFFSET_PCT / 100.0)
+                        candidates.append(be_sl)
+                    elif side == "SHORT" and current_price <= tp1:
+                        be_sl = entry * (1 - BREAKEVEN_OFFSET_PCT / 100.0)
+                        candidates.append(be_sl)
+
+            if TRAILING_ATR_ENABLED:
+                tf = TRAILING_ATR_TIMEFRAME if TRAILING_ATR_TIMEFRAME else (trade.get('timeframe') or '1h')
+                df = get_klines(symbol, tf, limit=max(ATR_PERIOD + 30, 100))
+                if df is not None and not df.empty and len(df) > ATR_PERIOD + 2:
+                    atr_series = ta.atr(df["high"], df["low"], df["close"], length=ATR_PERIOD)
+                    atr = float(atr_series.iloc[-1])
+                    if atr > 0:
+                        if side == "LONG":
+                            trail_sl = current_price - (TRAILING_ATR_MULT * atr)
+                        else:
+                            trail_sl = current_price + (TRAILING_ATR_MULT * atr)
+                        candidates.append(trail_sl)
+
+            if not candidates:
+                continue
+
+            if side == "LONG":
+                target_sl = max([current_sl] + candidates)
+                better = target_sl > current_sl
+                valid_side = target_sl < current_price
+            else:
+                target_sl = min([current_sl] + candidates)
+                better = target_sl < current_sl
+                valid_side = target_sl > current_price
+
+            if not better or not valid_side:
+                continue
+
+            move_pct = abs(target_sl - current_sl) / entry if entry > 0 else 0.0
+            if move_pct < MIN_SL_MOVE_PERCENT:
+                continue
+
+            updated = trader.update_stop_loss(symbol=symbol, side=side, new_sl_price=target_sl)
+            if updated:
+                print(f"🛡️ SL dinámico aplicado en {symbol}: {current_sl:.6f} -> {target_sl:.6f}")
+
+    except Exception as e:
+        print(f"⚠️ Error en gestión dinámica de SL: {e}")
+
 def main():
     """Loop infinito que escanea cada 30 minutos"""
     print("🚀 Bot Swing EMA + Auto Trading iniciado")
     print(f"📊 Monitoreando {len(WATCHLIST)} cryptos")
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
     print(f"📊 Base de datos: trading_history.db")
+    print(f"🛡️ Risk Profile: {RISK_PROFILE_SNAPSHOT['RISK_PROFILE_SELECTED']} ({RISK_PROFILE_SNAPSHOT['RISK_ENV_MODE']})")
+    print(f"   • MAX_DAILY_LOSS_USDT={RISK_PROFILE_SNAPSHOT['MAX_DAILY_LOSS_USDT']} | MAX_CONSECUTIVE_LOSSES={RISK_PROFILE_SNAPSHOT['MAX_CONSECUTIVE_LOSSES']}")
+    print(f"   • MAX_DRAWDOWN_PCT={RISK_PROFILE_SNAPSHOT['MAX_DRAWDOWN_PCT']} | PAUSE_MIN={RISK_PROFILE_SNAPSHOT['RISK_GUARD_PAUSE_MINUTES']}")
     
     if AUTO_TRADE_ENABLED:
         print(f"🤖 TRADING AUTOMÁTICO ACTIVADO")
@@ -878,26 +1244,30 @@ def main():
     print(f"   ✅ Distancia EMAs: mín {MIN_EMA_DISTANCE*100}%")
     print(f"   ✅ SL máximo: {MAX_SL_PERCENT*100}%")
     print(f"   ✅ Tendencia EMA200: {'Requerida' if REQUIRE_EMA200_TREND else 'No requerida'}")
+    print(f"   ✅ SL dinámico: {'ON' if DYNAMIC_SL_ENABLED else 'OFF'} | Breakeven TP1: {'ON' if BREAKEVEN_ON_TP1 else 'OFF'} | Trail ATR: {'ON' if TRAILING_ATR_ENABLED else 'OFF'}")
+    print(f"   ✅ Cierre temprano por PnL: {'ON' if EARLY_PROFIT_TAKE_ENABLED else 'OFF'} | Umbral: {EARLY_PROFIT_TAKE_USDT:.2f} USDT")
     
     print(f"\n🔄 Escaneando cada 15 minutos...\n")
     
     # Mensaje inicial
     tf_list = ", ".join(TIMEFRAME_NAMES.values())
     mode = "🤖 TRADING AUTOMÁTICO" if AUTO_TRADE_ENABLED else "📢 SOLO ALERTAS"
-    send_telegram(f"""🚀 <b>Bot Swing EMA Iniciado</b>
-
-{mode}
-📊 {len(WATCHLIST)} cryptos
-⏰ Timeframes: {tf_list}
-🔄 Escaneo cada 15 min
-
-🛡️ Filtros Swing activados""")
+    send_telegram(
+        f"🚀 <b>BOT INICIADO</b>\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+        f"{mode}\n"
+        f"📊 Activos: {len(WATCHLIST)}\n"
+        f"⏰ Timeframes: {tf_list}\n"
+        f"🔄 Escaneo: cada 15 min"
+    )
     
     cycle = 0
     while True:
         try:
             # Mostrar posiciones antes del escaneo
             show_positions_summary()
+            manage_dynamic_stop_losses()
+            reconcile_closed_trades_and_notify()
             
             # Escanear
             cycle += 1
@@ -909,6 +1279,8 @@ def main():
             
             # Mostrar posiciones después del escaneo
             show_positions_summary()
+            manage_dynamic_stop_losses()
+            reconcile_closed_trades_and_notify()
             
             # Esperar 15 minutos (900 segundos) con cuenta regresiva visible
             total = 900
@@ -924,11 +1296,19 @@ def main():
             
         except KeyboardInterrupt:
             print("\n\n⚠️ Bot detenido por el usuario")
-            send_telegram("⚠️ Bot Swing EMA detenido")
+            send_telegram(
+                f"⚠️ <b>BOT DETENIDO</b>\n"
+                f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                f"🛑 Detenido por usuario"
+            )
             break
         except Exception as e:
             print(f"\n❌ Error crítico: {e}")
-            send_telegram(f"❌ Bot error: {e}")
+            send_telegram(
+                f"❌ <b>BOT ERROR</b>\n"
+                f"🤖 Bot: <b>{BOT_NAME}</b>\n"
+                f"⚠️ Detalle: {e}"
+            )
             print("⏳ Reintentando en 5 minutos...")
             time.sleep(600)
 

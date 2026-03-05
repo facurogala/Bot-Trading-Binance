@@ -203,6 +203,22 @@ class TradingDatabase:
         quantity = trade[5]
         leverage = trade[6]
         side = trade[2]
+
+        if not entry_price or entry_price <= 0:
+            print(f"⚠️ Trade {trade_id} con entry_price inválido ({entry_price}). Cerrando sin cálculo de PnL.")
+            pnl_percent = 0.0
+            pnl = 0.0
+            exit_time = datetime.now()
+            cursor.execute('''
+                UPDATE trades 
+                SET exit_price = ?, exit_time = ?, status = 'CLOSED',
+                    pnl = ?, pnl_percent = ?, exit_reason = ?
+                WHERE id = ?
+            ''', (exit_price, exit_time, pnl, pnl_percent, exit_reason, trade_id))
+            conn.commit()
+            conn.close()
+            self.update_daily_stats()
+            return
         
         if side == "LONG":
             pnl_percent = ((exit_price - entry_price) / entry_price) * 100 * leverage

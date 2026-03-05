@@ -13,9 +13,12 @@ import requests
 from binance_futures_trader import BinanceFuturesTrader
 from trading_database import TradingDatabase
 from trading_dashboard import TradingDashboard, generate_quick_report
+from risk_guard import RiskGuard
+from risk_profiles import apply_risk_profile_defaults
 
 # ================== CONFIG ==================
 load_dotenv()
+RISK_PROFILE_SNAPSHOT = apply_risk_profile_defaults()
 TOKEN   = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -26,6 +29,7 @@ if not TOKEN or not CHAT_ID:
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "False").lower() == "true"
 USE_MARKET_ORDER = os.getenv("USE_MARKET_ORDER", "False").lower() == "true"
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))  # Máximo de posiciones simultáneas
+BOT_NAME = "Scanner"
 
 # Timeframes Swing
 TIMEFRAMES = ["1h", "2h", "4h", "6h", "12h", "1d"]
@@ -155,6 +159,17 @@ POSITION_SIZE_MULT = 1.0
 LEVERAGE_CAP = 5
 PYRAMIDING = False
 PARTIALS = {"TP1": 1.272, "TP2": 1.414, "TP3": 1.618}
+
+# Gestión dinámica de salida
+DYNAMIC_SL_ENABLED = os.getenv("SCANNER_DYNAMIC_SL_ENABLED", os.getenv("DYNAMIC_SL_ENABLED", "True")).lower() == "true"
+BREAKEVEN_ON_TP1 = os.getenv("SCANNER_BREAKEVEN_ON_TP1", os.getenv("BREAKEVEN_ON_TP1", "True")).lower() == "true"
+BREAKEVEN_OFFSET_PCT = float(os.getenv("SCANNER_BREAKEVEN_OFFSET_PCT", os.getenv("BREAKEVEN_OFFSET_PCT", "0.0")))
+TRAILING_ATR_ENABLED = os.getenv("SCANNER_TRAILING_ATR_ENABLED", os.getenv("TRAILING_ATR_ENABLED", "True")).lower() == "true"
+TRAILING_ATR_MULT = float(os.getenv("SCANNER_TRAILING_ATR_MULT", "1.0"))
+TRAILING_ATR_TIMEFRAME = os.getenv("SCANNER_TRAILING_ATR_TIMEFRAME", "1h")
+MIN_SL_MOVE_PERCENT = float(os.getenv("SCANNER_MIN_SL_MOVE_PERCENT", "0.001"))
+EARLY_PROFIT_TAKE_ENABLED = os.getenv("SCANNER_EARLY_PROFIT_TAKE_ENABLED", os.getenv("EARLY_PROFIT_TAKE_ENABLED", "True")).lower() == "true"
+EARLY_PROFIT_TAKE_USDT = float(os.getenv("SCANNER_EARLY_PROFIT_TAKE_USDT", os.getenv("EARLY_PROFIT_TAKE_USDT", "10.0")))
 
 # Estado runtime
 _last_trade_time = {}
@@ -301,6 +316,7 @@ if AUTO_TRADE_ENABLED:
 # Inicializar base de datos
 db = TradingDatabase("trading_history.db")
 print("✅ Base de datos de trading inicializada")
+risk_guard = RiskGuard(db, BOT_NAME)
 
 # Diccionario para rastrear trades abiertos
 open_trades_registry = {}  # {symbol: trade_id}
@@ -471,6 +487,24 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
         return False
     
     try:
+        key = f"{symbol}:{timeframe}"
+        now = time.time()
+        last_t = _last_trade_time.get(key, 0)
+        if now - last_t < COOLDOWN_AFTER_TRADE_MIN * 60:
+            print(f"⏳ Cooldown activo para {key}, omitiendo...")
+            return False
+
+        day = datetime.utcnow().strftime('%Y-%m-%d')
+        cnt = _daily_trade_count.get(day, 0)
+        if cnt >= MAX_TRADES_PER_DAY:
+            print(f"⛔ Límite diario de trades alcanzado ({MAX_TRADES_PER_DAY})")
+            return False
+
+        can_trade, reason = risk_guard.can_open_trade(symbol=symbol)
+        if not can_trade:
+            print(f"🛑 RiskGuard bloqueó trade en {symbol}: {reason}")
+            return False
+
         # Verificar número de posiciones abiertas
         open_positions = trader.get_open_positions()
         
@@ -506,7 +540,7 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                 tp_prices=result['tp_prices'],
                 timeframe=timeframe,
                 notes=f"Señal EMA - {timeframe}",
-                bot="Scanner"
+                bot=BOT_NAME
             )
             
             # Registrar órdenes individuales
@@ -562,6 +596,8 @@ def execute_trade(symbol: str, side: str, levels: dict, timeframe: str):
                     )
             
             print(f"✅ Trade ejecutado y registrado: {symbol} {side} (ID: {trade_id})")
+            _last_trade_time[key] = now
+            _daily_trade_count[day] = cnt + 1
             return True
         else:
             print(f"❌ No se pudo ejecutar el trade en {symbol}")
@@ -714,6 +750,125 @@ def check_closed_positions():
     for symbol in closed_symbols:
         del open_trades_registry[symbol]
 
+def manage_dynamic_stop_losses():
+    """Gestiona cierres tempranos por PnL, reposición SL/TP y trailing/breakeven."""
+    if not AUTO_TRADE_ENABLED or trader is None or not DYNAMIC_SL_ENABLED:
+        return
+
+    try:
+        positions = trader.get_open_positions()
+        if not positions:
+            return
+
+        open_trades = [
+            t for t in db.get_open_trades()
+            if str(t.get('bot') or '').lower() == BOT_NAME.lower()
+        ]
+        trade_by_symbol = {t['symbol']: t for t in open_trades}
+
+        for pos in positions:
+            symbol = pos['symbol']
+            side = pos['side']
+            qty = float(pos.get('quantity', 0))
+            entry = float(pos['entryPrice'])
+            upnl = float(pos.get('unrealizedProfit', 0))
+            current_sl = pos.get('stopLoss')
+
+            trade = trade_by_symbol.get(symbol)
+            if not trade:
+                continue
+
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+
+            if EARLY_PROFIT_TAKE_ENABLED and upnl >= EARLY_PROFIT_TAKE_USDT:
+                print(f"💰 Cierre temprano (Scanner) {symbol}: uPnL={upnl:+.2f} USDT >= {EARLY_PROFIT_TAKE_USDT:.2f}")
+                closed = trader.close_position(symbol)
+                if closed:
+                    try:
+                        trader.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+                    try:
+                        trade_id = trade.get('id')
+                        if trade_id is not None:
+                            db.close_trade(int(trade_id), exit_price=current_price, exit_reason="EARLY_TP_UPNL")
+                    except Exception as e:
+                        print(f"⚠️ No se pudo cerrar trade en DB para {symbol}: {e}")
+                    send_telegram(f"💰 <b>EARLY TP (Scanner)</b>\n{display_symbol(symbol)} {side}\nPnL: {upnl:+.2f} USDT\nPrecio salida: {current_price}")
+                continue
+
+            if (current_sl is None or len(pos.get('takeProfits') or []) == 0) and trader.reconciler is not None:
+                try:
+                    tp_prices = trade.get('tp_prices') or []
+                    sl_db = float(trade.get('sl_price')) if trade.get('sl_price') is not None else None
+                    if sl_db is not None and len(tp_prices) > 0 and qty > 0:
+                        sl_order, tp_orders = trader.reconciler.ensure_orders_exist(
+                            symbol=symbol,
+                            side=side,
+                            quantity=qty,
+                            sl_price=sl_db,
+                            tp_prices=tp_prices,
+                            max_retries=2,
+                        )
+                        if sl_order or tp_orders:
+                            print(f"🛡️ Reconciliación de salida (Scanner) {symbol}: SL={bool(sl_order)} TPs={len(tp_orders)}")
+                except Exception as e:
+                    print(f"⚠️ No se pudieron reponer SL/TP en {symbol}: {e}")
+
+            current_sl = pos.get('stopLoss')
+            if current_sl is None:
+                continue
+            current_sl = float(current_sl)
+
+            candidates = []
+            if BREAKEVEN_ON_TP1:
+                tp_prices = trade.get('tp_prices') or []
+                tp1 = float(tp_prices[0]) if tp_prices else None
+                if tp1:
+                    if side == "LONG" and current_price >= tp1:
+                        candidates.append(entry * (1 + BREAKEVEN_OFFSET_PCT / 100.0))
+                    elif side == "SHORT" and current_price <= tp1:
+                        candidates.append(entry * (1 - BREAKEVEN_OFFSET_PCT / 100.0))
+
+            if TRAILING_ATR_ENABLED:
+                tf = TRAILING_ATR_TIMEFRAME or (trade.get('timeframe') or '1h')
+                df = get_klines(symbol, tf, limit=max(ATR_PERIOD + 30, 120))
+                if df is not None and not df.empty and len(df) > ATR_PERIOD + 2:
+                    atr_series = ta.atr(df["high"], df["low"], df["close"], length=ATR_PERIOD)
+                    atr = float(atr_series.iloc[-1])
+                    if atr > 0:
+                        if side == "LONG":
+                            candidates.append(current_price - (TRAILING_ATR_MULT * atr))
+                        else:
+                            candidates.append(current_price + (TRAILING_ATR_MULT * atr))
+
+            if not candidates:
+                continue
+
+            if side == "LONG":
+                target_sl = max([current_sl] + candidates)
+                better = target_sl > current_sl
+                valid_side = target_sl < current_price
+            else:
+                target_sl = min([current_sl] + candidates)
+                better = target_sl < current_sl
+                valid_side = target_sl > current_price
+
+            if not better or not valid_side:
+                continue
+
+            move_pct = abs(target_sl - current_sl) / entry if entry > 0 else 0.0
+            if move_pct < MIN_SL_MOVE_PERCENT:
+                continue
+
+            updated = trader.update_stop_loss(symbol=symbol, side=side, new_sl_price=target_sl)
+            if updated:
+                print(f"🛡️ SL dinámico (Scanner) {symbol}: {current_sl:.6f} -> {target_sl:.6f}")
+
+    except Exception as e:
+        print(f"⚠️ Error en gestión dinámica de SL (Scanner): {e}")
+
 def show_positions_summary():
     """Muestra un resumen de las posiciones abiertas"""
     if not AUTO_TRADE_ENABLED or trader is None:
@@ -771,6 +926,9 @@ def main():
     print(f"⏰ Timeframes: {', '.join(TIMEFRAME_NAMES.values())}")
     print(f"📊 Base de datos: trading_history.db")
     print(f"📈 Reportes automáticos: Activados")
+    print(f"🛡️ Risk Profile: {RISK_PROFILE_SNAPSHOT['RISK_PROFILE_SELECTED']} ({RISK_PROFILE_SNAPSHOT['RISK_ENV_MODE']})")
+    print(f"   • MAX_DAILY_LOSS_USDT={RISK_PROFILE_SNAPSHOT['MAX_DAILY_LOSS_USDT']} | MAX_CONSECUTIVE_LOSSES={RISK_PROFILE_SNAPSHOT['MAX_CONSECUTIVE_LOSSES']}")
+    print(f"   • MAX_DRAWDOWN_PCT={RISK_PROFILE_SNAPSHOT['MAX_DRAWDOWN_PCT']} | PAUSE_MIN={RISK_PROFILE_SNAPSHOT['RISK_GUARD_PAUSE_MINUTES']}")
     
     if AUTO_TRADE_ENABLED:
         print(f"🤖 TRADING AUTOMÁTICO ACTIVADO")
@@ -783,6 +941,9 @@ def main():
             print(f"⚠️ Riesgo por trade: {trader.risk_percent}%")
     else:
         print(f"📢 MODO SOLO ALERTAS (trading desactivado)")
+
+    print(f"   ✅ SL dinámico: {'ON' if DYNAMIC_SL_ENABLED else 'OFF'} | Breakeven TP1: {'ON' if BREAKEVEN_ON_TP1 else 'OFF'} | Trail ATR: {'ON' if TRAILING_ATR_ENABLED else 'OFF'} ({TRAILING_ATR_MULT}x)")
+    print(f"   ✅ Cierre temprano por PnL: {'ON' if EARLY_PROFIT_TAKE_ENABLED else 'OFF'} | Umbral: {EARLY_PROFIT_TAKE_USDT:.2f} USDT")
     
     print(f"🔄 Escaneando cada 30 minutos...\n")
     
@@ -801,6 +962,7 @@ def main():
         try:
             # Mostrar posiciones antes del escaneo
             show_positions_summary()
+            manage_dynamic_stop_losses()
             
             # Escanear
             cycle += 1
@@ -812,6 +974,7 @@ def main():
             
             # Mostrar posiciones después del escaneo
             show_positions_summary()
+            manage_dynamic_stop_losses()
             
             # Esperar 30 minutos (1800 segundos) con cuenta regresiva visible
             total = 1800
