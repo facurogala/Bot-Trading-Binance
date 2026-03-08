@@ -3,27 +3,97 @@
 ║              REPORTE DE TRADING (CONSOLIDADO)                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 
-Generado: 2026-03-05 14:54:05
+Generado: 2026-03-08 03:03:53
 
 ESTADÍSTICAS GENERALES
 ============================================================
-Total de Trades:           13
-Trades Ganadores:          4 (30.8%)
-Trades Perdedores:         7 (69.2%)
+Total de Trades:           20
+Trades Ganadores:          10 (50.0%)
+Trades Perdedores:         8 (50.0%)
 
 RENDIMIENTO
 ============================================================
-PnL Total:                 $7291.84
-Promedio Ganancia:         $2139.43
-Promedio Pérdida:          $-180.84
+PnL Total:                 $7320.45
+Promedio Ganancia:         $860.75
+Promedio Pérdida:          $-160.88
 Mejor Trade:               $7936.31
 Peor Trade:                $-268.33
-Profit Factor:             6.76
+Profit Factor:             6.69
 
 ÚLTIMOS 10 TRADES
 ============================================================
 
 Trade #1:
+  Símbolo:    HBARUSDT
+  Lado:       SHORT
+  Entrada:    $0.09
+  Salida:     $0.09
+  PnL:        +$1.00 (+0.22%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-08 00:16:26.859708
+
+Trade #2:
+  Símbolo:    HBARUSDT
+  Lado:       SHORT
+  Entrada:    $0.10
+  Salida:     $0.10
+  PnL:        +$6.47 (+1.44%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-07 23:42:47.202440
+
+Trade #3:
+  Símbolo:    ALGOUSDT
+  Lado:       SHORT
+  Entrada:    $0.08
+  Salida:     $0.08
+  PnL:        +$10.24 (+2.28%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-07 23:42:45.439931
+
+Trade #4:
+  Símbolo:    GALAUSDT
+  Lado:       SHORT
+  Entrada:    $0.00
+  Salida:     $0.00
+  PnL:        +$19.37 (+4.32%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-07 19:51:54.398747
+
+Trade #5:
+  Símbolo:    MANAUSDT
+  Lado:       SHORT
+  Entrada:    $0.09
+  Salida:     $0.09
+  PnL:        +$8.75 (+1.95%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-07 11:17:10.785620
+
+Trade #6:
+  Símbolo:    GALAUSDT
+  Lado:       SHORT
+  Entrada:    $0.00
+  Salida:     $0.00
+  PnL:        +$3.96 (+0.88%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  2h
+  Fecha:      2026-03-06 11:35:59.928230
+
+Trade #7:
+  Símbolo:    QNTUSDT
+  Lado:       LONG
+  Entrada:    $66.25
+  Salida:     $65.18
+  PnL:        $-21.19 (-4.85%)
+  Razón:      SYNC_CLOSE
+  Timeframe:  1h
+  Fecha:      2026-03-06 11:18:35.037070
+
+Trade #8:
   Símbolo:    EGLDUSDT
   Lado:       SHORT
   Entrada:    $4.22
@@ -33,7 +103,7 @@ Trade #1:
   Timeframe:  2h
   Fecha:      2026-03-05 14:37:08.390771
 
-Trade #2:
+Trade #9:
   Símbolo:    SANDUSDT
   Lado:       LONG
   Entrada:    $0.09
@@ -43,7 +113,7 @@ Trade #2:
   Timeframe:  1h
   Fecha:      2026-03-04 21:35:10.198529
 
-Trade #3:
+Trade #10:
   Símbolo:    CRVUSDT
   Lado:       LONG
   Entrada:    $0.27
@@ -52,73 +122,3 @@ Trade #3:
   Razón:      SYNC_CLOSE
   Timeframe:  1h
   Fecha:      2026-03-04 13:13:54.381006
-
-Trade #4:
-  Símbolo:    CRVUSDT
-  Lado:       LONG
-  Entrada:    $0.26
-  Salida:     $0.26
-  PnL:        +$150.10 (+3.47%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-04 12:57:15.108702
-
-Trade #5:
-  Símbolo:    GALAUSDT
-  Lado:       SHORT
-  Entrada:    $0.00
-  Salida:     $0.00
-  PnL:        $-268.33 (-7.76%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-03 15:31:11.026733
-
-Trade #6:
-  Símbolo:    FLOWUSDT
-  Lado:       SHORT
-  Entrada:    $0.03
-  Salida:     $0.04
-  PnL:        $-82.49 (-4.85%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  4h
-  Fecha:      2026-03-03 14:35:14.023674
-
-Trade #7:
-  Símbolo:    CAKEUSDT
-  Lado:       LONG
-  Entrada:    $1.34
-  Salida:     $1.34
-  PnL:        $-34.76 (-0.69%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-03 14:35:02.349849
-
-Trade #8:
-  Símbolo:    WOOUSDT
-  Lado:       LONG
-  Entrada:    $0.02
-  Salida:     $0.02
-  PnL:        +$215.10 (+7.24%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-03 13:30:14.361004
-
-Trade #9:
-  Símbolo:    QNTUSDT
-  Lado:       SHORT
-  Entrada:    $61.35
-  Salida:     $62.29
-  PnL:        $-216.58 (-4.60%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-03 13:13:22.878497
-
-Trade #10:
-  Símbolo:    WOOUSDT
-  Lado:       LONG
-  Entrada:    $0.02
-  Salida:     $0.02
-  PnL:        $-224.46 (-6.51%)
-  Razón:      SYNC_CLOSE
-  Timeframe:  1h
-  Fecha:      2026-03-03 12:22:31.195044
